@@ -20,7 +20,6 @@ st.set_page_config(
 # Helpers de lectura del Excel
 # -----------------------------
 
-DEFAULT_SAMPLE_PATH = "sample_data/Data.xlsx"
 
 
 @dataclass
@@ -220,6 +219,169 @@ def compute_n_points(perimeter: float, separation: int, mode: str) -> int:
     else:
         val = math.floor(ratio)
     return max(1, int(val))
+
+
+# -----------------------------
+# Helpers de exportación
+# -----------------------------
+
+INVALID_SHEET_CHARS = str.maketrans({c: "_" for c in '[]:*?/\\'})
+
+
+def safe_sheet_name(name: str, prefix: str = "", used: Optional[set] = None) -> str:
+    """Crea nombres de hoja válidos para Excel: máximo 31 caracteres y sin caracteres inválidos."""
+    used = used if used is not None else set()
+    base = f"{prefix}{name}".translate(INVALID_SHEET_CHARS).strip()
+    base = "_".join(base.split())
+    if not base:
+        base = "Hoja"
+    base = base[:31]
+    candidate = base
+    counter = 2
+    while candidate in used:
+        suffix = f"_{counter}"
+        candidate = f"{base[:31-len(suffix)]}{suffix}"
+        counter += 1
+    used.add(candidate)
+    return candidate
+
+
+def _integer_proportional_allocation(total: int, capacities: pd.Series) -> pd.Series:
+    """Distribuye enteros proporcionalmente a capacidades, manteniendo suma exacta."""
+    total = int(total)
+    capacities = pd.to_numeric(capacities, errors="coerce").fillna(0).astype(float)
+    if total <= 0 or capacities.sum() <= 0:
+        return pd.Series([0] * len(capacities), index=capacities.index, dtype=int)
+
+    raw = capacities / capacities.sum() * total
+    base = raw.apply(math.floor).astype(int)
+    remainder = total - int(base.sum())
+    if remainder > 0:
+        order = (raw - base).sort_values(ascending=False).index[:remainder]
+        base.loc[order] += 1
+    return base.astype(int)
+
+
+def build_lab_allocation_by_circle(plan_df: pd.DataFrame, lab_result_df: pd.DataFrame, lab_input_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Genera una asignación sugerida de análisis de laboratorio por círculo.
+
+    Nota metodológica: el MILP decide las cantidades globales L_k. Esta tabla reparte esas
+    cantidades entre círculos de forma proporcional a las muestras físicas producidas en campo.
+    """
+    if plan_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    plan = plan_df.copy()
+    if "produce_muestra_lab" not in plan.columns:
+        plan["produce_muestra_lab"] = False
+
+    all_circles = plan[["circulo", "perimetro_m"]].drop_duplicates().sort_values("circulo").reset_index(drop=True)
+    capacity = (
+        plan[plan["produce_muestra_lab"].astype(bool)]
+        .groupby("circulo", as_index=True)["puntos"]
+        .sum()
+        .rename("muestras_campo_disponibles")
+    )
+    wide = all_circles.merge(capacity, left_on="circulo", right_index=True, how="left")
+    wide["muestras_campo_disponibles"] = pd.to_numeric(wide["muestras_campo_disponibles"], errors="coerce").fillna(0).astype(int)
+
+    lab_costs = lab_input_df[["analisis", "costo_por_muestra"]].copy()
+    lab_counts = lab_result_df[["analisis", "muestras_L"]].merge(lab_costs, on="analisis", how="left")
+
+    long_rows = []
+    for _, lab_row in lab_counts.iterrows():
+        analysis = lab_row["analisis"]
+        total_samples = int(round(_safe_float(lab_row.get("muestras_L"), 0)))
+        cost_per_sample = _safe_float(lab_row.get("costo_por_muestra"), 0)
+        allocation = _integer_proportional_allocation(total_samples, wide["muestras_campo_disponibles"])
+        wide[analysis] = allocation.values
+        for idx, alloc in allocation.items():
+            long_rows.append(
+                {
+                    "circulo": wide.loc[idx, "circulo"],
+                    "perimetro_m": wide.loc[idx, "perimetro_m"],
+                    "muestras_campo_disponibles": int(wide.loc[idx, "muestras_campo_disponibles"]),
+                    "analisis": analysis,
+                    "muestras_asignadas": int(alloc),
+                    "costo_estimado_COP": int(round(int(alloc) * cost_per_sample)),
+                }
+            )
+
+    long_df = pd.DataFrame(long_rows)
+    if not long_df.empty:
+        long_df = long_df.sort_values(["circulo", "analisis"]).reset_index(drop=True)
+    return wide, long_df
+
+
+def build_excel_report(result: Dict, field_input_df: pd.DataFrame, lab_input_df: pd.DataFrame) -> bytes:
+    """Construye un Excel multi-hoja con resumen, plan por actividad y laboratorio por círculo."""
+    output = io.BytesIO()
+    used_sheets = set()
+
+    kpis = result.get("kpis", {})
+    summary_rows = [
+        {"Indicador": key, "Valor": value}
+        for key, value in kpis.items()
+    ]
+    summary = pd.DataFrame(summary_rows)
+
+    plan = result.get("plan", pd.DataFrame()).copy()
+    field = result.get("field", pd.DataFrame()).copy()
+    lab = result.get("lab", pd.DataFrame()).copy()
+    logs = pd.DataFrame(result.get("logs", []))
+    lab_by_circle, lab_long = build_lab_allocation_by_circle(plan, lab, lab_input_df)
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        # Hojas principales
+        sheet = safe_sheet_name("Resumen", used=used_sheets)
+        summary.to_excel(writer, sheet_name=sheet, index=False, startrow=0)
+        field.to_excel(writer, sheet_name=sheet, index=False, startrow=len(summary) + 3)
+        lab.to_excel(writer, sheet_name=sheet, index=False, startrow=len(summary) + len(field) + 6)
+
+        sheet = safe_sheet_name("Plan_completo", used=used_sheets)
+        plan.to_excel(writer, sheet_name=sheet, index=False)
+
+        sheet = safe_sheet_name("Campo_resumen", used=used_sheets)
+        field.to_excel(writer, sheet_name=sheet, index=False)
+
+        sheet = safe_sheet_name("Laboratorio_resumen", used=used_sheets)
+        lab.to_excel(writer, sheet_name=sheet, index=False)
+
+        sheet = safe_sheet_name("Lab_por_circulo", used=used_sheets)
+        lab_by_circle.to_excel(writer, sheet_name=sheet, index=False)
+
+        sheet = safe_sheet_name("Lab_detalle_circulo", used=used_sheets)
+        lab_long.to_excel(writer, sheet_name=sheet, index=False)
+
+        # Una hoja por tipo de actividad de campo
+        if not plan.empty and "actividad" in plan.columns:
+            for activity in sorted(plan["actividad"].dropna().unique()):
+                filtered = plan[plan["actividad"] == activity].copy()
+                sheet = safe_sheet_name(str(activity), prefix="Campo_", used=used_sheets)
+                filtered.to_excel(writer, sheet_name=sheet, index=False)
+
+        # Una hoja por tipo de análisis de laboratorio
+        if not lab_long.empty and "analisis" in lab_long.columns:
+            for analysis in sorted(lab_long["analisis"].dropna().unique()):
+                filtered = lab_long[lab_long["analisis"] == analysis].copy()
+                sheet = safe_sheet_name(str(analysis), prefix="Lab_", used=used_sheets)
+                filtered.to_excel(writer, sheet_name=sheet, index=False)
+
+        sheet = safe_sheet_name("Log_solver", used=used_sheets)
+        logs.to_excel(writer, sheet_name=sheet, index=False)
+
+        # Formato básico: congelar encabezados y ajustar anchuras.
+        for ws in writer.book.worksheets:
+            ws.freeze_panes = "A2"
+            for col_cells in ws.columns:
+                header = col_cells[0].value if col_cells else ""
+                max_len = len(str(header)) if header is not None else 0
+                for cell in col_cells[:200]:
+                    if cell.value is not None:
+                        max_len = max(max_len, len(str(cell.value)))
+                ws.column_dimensions[col_cells[0].column_letter].width = min(max(max_len + 2, 10), 38)
+
+    return output.getvalue()
 
 
 # -----------------------------
@@ -430,6 +592,7 @@ def solve_milp_ahp(
                                 "puntos": points,
                                 "tiempo_h": points * t[f],
                                 "costo_COP": points * field_cost[f],
+                                "produce_muestra_lab": produce_lab_sample.get(f, False),
                             }
                         )
 
@@ -509,7 +672,6 @@ st.caption("Asignación de recursos entre campo y laboratorio usando prioridades
 with st.sidebar:
     st.header("1) Datos")
     uploaded = st.file_uploader("Carga tu Data.xlsx", type=["xlsx"])
-    use_example = st.checkbox("Usar archivo de ejemplo incluido", value=uploaded is None)
 
     st.header("2) Solver")
     separations_text = st.text_input("Separaciones permitidas en metros", value="10, 20, 50")
@@ -541,15 +703,13 @@ with st.sidebar:
         format_func=lambda x: f"{x:g}",
     )
 
-# Carga inicial
+# Carga inicial: el usuario debe cargar su propio Excel.
+if uploaded is None:
+    st.info("Carga tu archivo Data.xlsx para comenzar.")
+    st.stop()
+
 try:
-    if uploaded is not None:
-        parsed = parse_excel(uploaded)
-    elif use_example:
-        parsed = parse_excel(DEFAULT_SAMPLE_PATH)
-    else:
-        st.info("Carga un archivo Excel para comenzar.")
-        st.stop()
+    parsed = parse_excel(uploaded)
 except Exception as exc:
     st.error(f"No pude leer el Excel: {exc}")
     st.stop()
@@ -683,15 +843,30 @@ if run:
     fig.update_layout(yaxis_tickformat=".0%", yaxis_title="Participación del presupuesto", xaxis_title="")
     st.plotly_chart(fig, use_container_width=True)
 
+    lab_by_circle, lab_long = build_lab_allocation_by_circle(result["plan"], result["lab"], clean_lab_df)
+    excel_report = build_excel_report(result, clean_field_df, clean_lab_df)
+
     tab1, tab2, tab3, tab4 = st.tabs(["Plan por círculo", "Campo", "Laboratorio", "Log solver"])
     with tab1:
         st.dataframe(result["plan"], use_container_width=True)
-        st.download_button(
-            "Descargar plan CSV",
-            data=result["plan"].to_csv(index=False).encode("utf-8"),
-            file_name="plan_muestreo.csv",
-            mime="text/csv",
-        )
+        c_csv, c_xlsx = st.columns(2)
+        with c_csv:
+            st.download_button(
+                "Descargar plan CSV",
+                data=result["plan"].to_csv(index=False).encode("utf-8"),
+                file_name="plan_muestreo.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        with c_xlsx:
+            st.download_button(
+                "Descargar reporte Excel multi-hoja",
+                data=excel_report,
+                file_name="reporte_muestreo_MILP_AHP.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        st.caption("El CSV solo puede contener una tabla. Para tener varias hojas usa el reporte Excel multi-hoja.")
     with tab2:
         st.dataframe(result["field"], use_container_width=True)
         if not result["field"].empty:
@@ -705,7 +880,14 @@ if run:
             fig_f.update_layout(yaxis_tickformat=".0%", xaxis_title="", yaxis_title="Participación dentro de campo")
             st.plotly_chart(fig_f, use_container_width=True)
     with tab3:
+        st.markdown("**Resumen global de laboratorio**")
         st.dataframe(result["lab"], use_container_width=True)
+        st.markdown("**Asignación sugerida de laboratorio por círculo**")
+        st.caption(
+            "El modelo optimiza las cantidades globales de laboratorio. "
+            "Esta tabla reparte esas cantidades entre círculos proporcionalmente a las muestras físicas disponibles."
+        )
+        st.dataframe(lab_by_circle, use_container_width=True)
         if not result["lab"].empty:
             lab_plot = result["lab"].melt(
                 id_vars="analisis",
