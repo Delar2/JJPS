@@ -40,6 +40,66 @@ def _safe_float(value, default=0.0):
         return default
 
 
+def _clean_name_series(series: pd.Series) -> pd.Series:
+    """Convierte nombres de tablas editables a texto limpio y elimina valores vacíos/NaN."""
+    return (
+        series
+        .astype("string")
+        .fillna("")
+        .str.strip()
+        .replace({"nan": "", "NaN": "", "None": "", "<NA>": ""})
+    )
+
+
+def clean_model_inputs(
+    circles: pd.DataFrame, field_df: pd.DataFrame, lab_df: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Limpia filas incompletas de Streamlit para evitar errores tipo `nan` en el solver."""
+    circles = circles.copy()
+    field_df = field_df.copy()
+    lab_df = lab_df.copy()
+
+    # Círculos válidos: ID no vacío, perímetro numérico y positivo.
+    if "ID" not in circles.columns or "Perimetro_m" not in circles.columns:
+        raise ValueError("La tabla de círculos debe contener las columnas ID y Perimetro_m.")
+    circles["ID"] = _clean_name_series(circles["ID"])
+    circles["Perimetro_m"] = pd.to_numeric(circles["Perimetro_m"], errors="coerce")
+    circles = circles[(circles["ID"] != "") & circles["Perimetro_m"].notna() & (circles["Perimetro_m"] > 0)]
+    circles = circles.drop_duplicates(subset=["ID"], keep="first").reset_index(drop=True)
+
+    # Actividades de campo válidas.
+    required_field = ["actividad", "tiempo_h_por_punto", "peso_ahp", "minimo", "produce_muestra_lab"]
+    for col in required_field:
+        if col not in field_df.columns:
+            field_df[col] = False if col == "produce_muestra_lab" else 0
+    field_df["actividad"] = _clean_name_series(field_df["actividad"])
+    field_df = field_df[field_df["actividad"] != ""].copy()
+    for col in ["tiempo_h_por_punto", "peso_ahp", "minimo"]:
+        field_df[col] = pd.to_numeric(field_df[col], errors="coerce").fillna(0)
+    field_df["produce_muestra_lab"] = field_df["produce_muestra_lab"].fillna(False).astype(bool)
+    field_df = field_df[field_df["tiempo_h_por_punto"] > 0].reset_index(drop=True)
+
+    # Análisis de laboratorio válidos.
+    required_lab = ["analisis", "costo_por_muestra", "peso_ahp", "minimo"]
+    for col in required_lab:
+        if col not in lab_df.columns:
+            lab_df[col] = 0
+    lab_df["analisis"] = _clean_name_series(lab_df["analisis"])
+    lab_df = lab_df[lab_df["analisis"] != ""].copy()
+    for col in ["costo_por_muestra", "peso_ahp", "minimo"]:
+        lab_df[col] = pd.to_numeric(lab_df[col], errors="coerce").fillna(0)
+    lab_df = lab_df[lab_df["costo_por_muestra"] >= 0].reset_index(drop=True)
+
+    if circles.empty:
+        raise ValueError("No hay círculos válidos. Revisa que cada fila tenga ID y perímetro positivo.")
+    if field_df.empty:
+        raise ValueError("No hay actividades de campo válidas. Revisa que cada actividad tenga nombre y tiempo > 0.")
+    if lab_df.empty:
+        raise ValueError("No hay análisis de laboratorio válidos. Revisa que cada análisis tenga nombre.")
+
+    return circles, field_df, lab_df
+
+
 def parse_excel(file_obj) -> ParsedData:
     """Lee Data.xlsx y lo transforma en tablas útiles para el modelo."""
     master = pd.read_excel(file_obj, sheet_name="Master_Datos")
@@ -148,6 +208,10 @@ def parse_separations(text: str) -> List[int]:
 
 
 def compute_n_points(perimeter: float, separation: int, mode: str) -> int:
+    if separation <= 0:
+        raise ValueError("Todas las separaciones deben ser mayores que cero.")
+    if not math.isfinite(float(perimeter)) or perimeter <= 0:
+        raise ValueError(f"Perímetro inválido: {perimeter}. Revisa la tabla de círculos.")
     ratio = perimeter / separation
     if mode == "ceil":
         val = math.ceil(ratio)
@@ -185,24 +249,17 @@ def solve_milp_ahp(
     Los costos se redondean a COP enteros para mejorar estabilidad y velocidad.
     Los pesos AHP se escalan a enteros con W_SCALE.
     """
-    if circles.empty:
-        raise ValueError("No hay círculos válidos para optimizar.")
-    if field_df.empty or lab_df.empty:
-        raise ValueError("Las tablas de campo y laboratorio no pueden estar vacías.")
+    circles, field_df, lab_df = clean_model_inputs(circles, field_df, lab_df)
 
-    field_df = field_df.copy().reset_index(drop=True)
-    lab_df = lab_df.copy().reset_index(drop=True)
-    circles = circles.copy().reset_index(drop=True)
-
-    # Limpieza numérica
+    # Limpieza numérica adicional: evita NaN cuando Streamlit deja celdas vacías.
     for col in ["tiempo_h_por_punto", "peso_ahp", "minimo"]:
         field_df[col] = pd.to_numeric(field_df[col], errors="coerce").fillna(0)
     for col in ["costo_por_muestra", "peso_ahp", "minimo"]:
         lab_df[col] = pd.to_numeric(lab_df[col], errors="coerce").fillna(0)
 
-    F = field_df["actividad"].astype(str).tolist()
-    K = lab_df["analisis"].astype(str).tolist()
-    I = circles["ID"].astype(str).tolist()
+    F = field_df["actividad"].tolist()
+    K = lab_df["analisis"].tolist()
+    I = circles["ID"].tolist()
     perimeter = dict(zip(I, circles["Perimetro_m"].astype(float)))
 
     # Pesos AHP globales y locales
@@ -550,8 +607,15 @@ with right:
     )
 
 # Diagnóstico AHP previo
-field_weight = pd.to_numeric(field_df["peso_ahp"], errors="coerce").fillna(0).sum()
-lab_weight = pd.to_numeric(lab_df["peso_ahp"], errors="coerce").fillna(0).sum()
+try:
+    preview_circles, preview_field_df, preview_lab_df = clean_model_inputs(circles_df, field_df, lab_df)
+except Exception as preview_exc:
+    st.warning(f"Hay filas incompletas o inválidas antes de resolver: {preview_exc}")
+    preview_field_df = field_df.copy()
+    preview_lab_df = lab_df.copy()
+
+field_weight = pd.to_numeric(preview_field_df["peso_ahp"], errors="coerce").fillna(0).sum()
+lab_weight = pd.to_numeric(preview_lab_df["peso_ahp"], errors="coerce").fillna(0).sum()
 total_weight = field_weight + lab_weight
 if total_weight > 0:
     st.info(
@@ -565,10 +629,11 @@ if run:
     try:
         separations = parse_separations(separations_text)
         with st.spinner("Resolviendo modelo lexicográfico..."):
+            clean_circles_df, clean_field_df, clean_lab_df = clean_model_inputs(circles_df, field_df, lab_df)
             result = solve_milp_ahp(
-                circles=circles_df,
-                field_df=field_df,
-                lab_df=lab_df,
+                circles=clean_circles_df,
+                field_df=clean_field_df,
+                lab_df=clean_lab_df,
                 separations=separations,
                 budget_cop=int(budget),
                 days_available=int(days),
