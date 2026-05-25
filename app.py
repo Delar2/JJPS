@@ -15,6 +15,11 @@ st.set_page_config(
     layout="wide",
 )
 
+# Mantiene la última solución aunque Streamlit haga rerun al descargar archivos.
+# Esto evita que el resultado desaparezca al presionar un botón de descarga.
+if "last_solution_bundle" not in st.session_state:
+    st.session_state.last_solution_bundle = None
+
 # =========================================================
 # CONFIGURACIÓN ESTRICTA SEGÚN FORMULACIÓN WORD
 # =========================================================
@@ -691,6 +696,7 @@ with st.sidebar:
         file_name="Data_template_MILP_AHP_word_strict.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
+        on_click="ignore",
     )
     data_mode = st.radio("Origen de datos", ["Subir Excel", "Ingresar manualmente"], index=0)
     uploaded = None
@@ -819,13 +825,43 @@ if run:
                 time_limit_per_stage=int(time_limit),
             )
     except Exception as exc:
+        st.session_state.last_solution_bundle = None
         st.error(f"Error al resolver: {exc}")
         st.stop()
 
     if not result.get("ok"):
+        st.session_state.last_solution_bundle = None
         st.error(result.get("error", "No se encontró solución."))
         st.dataframe(pd.DataFrame(result.get("logs", [])), use_container_width=True)
         st.stop()
+
+    # Se guardan datos, solución y archivos exportables en session_state.
+    # Así, si Streamlit hace rerun al descargar, no se pierde la corrida.
+    excel_report = build_excel_report(result, clean_field, clean_lab, params_used)
+    csv_report = result["plan"].to_csv(index=False).encode("utf-8")
+    lab_by_circle, lab_long = build_lab_allocation_by_circle(result["plan"], result["lab"], clean_lab)
+    st.session_state.last_solution_bundle = {
+        "result": result,
+        "clean_field": clean_field,
+        "clean_lab": clean_lab,
+        "params_used": params_used,
+        "excel_report": excel_report,
+        "csv_report": csv_report,
+        "lab_by_circle": lab_by_circle,
+        "lab_long": lab_long,
+    }
+
+bundle = st.session_state.get("last_solution_bundle")
+
+if bundle is not None:
+    result = bundle["result"]
+    clean_lab = bundle["clean_lab"]
+    excel_report = bundle["excel_report"]
+    csv_report = bundle["csv_report"]
+    lab_by_circle = bundle["lab_by_circle"]
+
+    if not run:
+        st.info("Se muestra la última solución calculada. Si cambiaste datos de entrada, ejecuta nuevamente la optimización.")
 
     if result.get("warning"):
         st.warning(result["warning"])
@@ -852,9 +888,6 @@ if run:
     fig.update_layout(yaxis_tickformat=".0%", yaxis_title="Participación del presupuesto", xaxis_title="")
     st.plotly_chart(fig, use_container_width=True)
 
-    lab_by_circle, lab_long = build_lab_allocation_by_circle(result["plan"], result["lab"], clean_lab)
-    excel_report = build_excel_report(result, clean_field, clean_lab, params_used)
-
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["Plan por círculo", "Campo", "Laboratorio", "Modelo usado", "Log solver"])
     with tab1:
         st.dataframe(result["plan"], use_container_width=True)
@@ -862,10 +895,11 @@ if run:
         with c_csv:
             st.download_button(
                 "Descargar plan CSV",
-                data=result["plan"].to_csv(index=False).encode("utf-8"),
+                data=csv_report,
                 file_name="plan_muestreo.csv",
                 mime="text/csv",
                 use_container_width=True,
+                on_click="ignore",
             )
         with c_xlsx:
             st.download_button(
@@ -874,6 +908,7 @@ if run:
                 file_name="reporte_muestreo_MILP_AHP_word_strict.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
+                on_click="ignore",
             )
     with tab2:
         st.dataframe(result["field"], use_container_width=True)
