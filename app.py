@@ -829,178 +829,19 @@ def solve_milp_ahp(
     return {"ok": True, **final_solution}
 
 
+
 # -----------------------------
 # UI
 # -----------------------------
 
-st.title("🧪 Optimización MILP-AHP para estrategias de muestreo")
-st.caption("Asignación de recursos entre campo y laboratorio usando prioridades AHP, restricciones geométricas, presupuesto y capacidad operativa.")
 
-with st.sidebar:
-    st.header("1) Datos")
-    st.download_button(
-        "📥 Descargar plantilla Excel",
-        data=build_template_excel_bytes(),
-        file_name="Data_template_MILP_AHP.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-        help="Plantilla con hojas Parametros, Circulos, Campo y Laboratorio.",
-    )
-    data_mode = st.radio(
-        "Origen de datos",
-        options=["Subir Excel", "Ingresar manualmente"],
-        index=0,
-        help="Puedes cargar un Excel con el formato de la plantilla o ingresar/editar los datos directamente en la app.",
-    )
-    uploaded = None
-    if data_mode == "Subir Excel":
-        uploaded = st.file_uploader("Carga tu Data.xlsx", type=["xlsx"])
+def render_solution(result: Dict, lab_by_circle: pd.DataFrame, excel_report: bytes, csv_bytes: bytes):
+    """Muestra la última solución guardada en session_state.
 
-    st.header("2) Solver")
-    separations_text = st.text_input("Separaciones permitidas en metros", value="10, 20, 50")
-    n_mode_label = st.selectbox(
-        "Cálculo de puntos por perímetro",
-        options=["floor", "ceil", "round"],
-        index=0,
-        help="floor = cuántos puntos caben sin exceder el perímetro; ceil = cubre todo el perímetro.",
-    )
-    allow_multiple = st.checkbox(
-        "Permitir varias actividades por círculo (formulación Word)",
-        value=True,
-        help="Más fiel al modelo: cada círculo incluido debe tener al menos una actividad, pero no necesariamente muestreo puntual.",
-    )
-    lab_cap_enabled = st.checkbox(
-        "Conservación total de muestras: laboratorio ≤ campo",
-        value=True,
-        help="Impone suma de todos los análisis de laboratorio ≤ muestras físicas recolectadas en actividades marcadas como Produce muestra lab.",
-    )
-    time_limit = st.slider("Tiempo máximo por etapa (s)", min_value=3, max_value=120, value=15, step=1)
-    relative_tolerance = st.select_slider(
-        "Tolerancia lexicográfica relativa",
-        options=[1e-7, 5e-7, 1e-6, 5e-6, 1e-5, 5e-5, 1e-4],
-        value=1e-6,
-        format_func=lambda x: f"{x:g}",
-    )
-
-# Carga inicial: Excel o entrada manual.
-if data_mode == "Subir Excel":
-    if uploaded is None:
-        st.info("Carga tu archivo Data.xlsx o descarga la plantilla para llenarla.")
-        st.stop()
-    try:
-        parsed = parse_excel(uploaded)
-    except Exception as exc:
-        st.error(f"No pude leer el Excel: {exc}")
-        st.stop()
-else:
-    parsed = default_manual_data()
-    st.info("Modo manual activo: edita las tablas directamente en la app. También puedes descargar la plantilla si prefieres preparar los datos en Excel.")
-
-params = parsed.params
-
-st.subheader("Parámetros generales")
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-with c1:
-    budget = st.number_input("Presupuesto total COP", value=int(_safe_float(params.get("Presupuesto Total Disponible"), 0)), min_value=1, step=1_000_000)
-with c2:
-    days = st.number_input("Días disponibles", value=int(_safe_float(params.get("Tiempo total disponible para el muestreo"), 60)), min_value=1, step=1)
-with c3:
-    hours = st.number_input("Horas/día", value=int(_safe_float(params.get("Horas efectivas de trabajo del equipo por día"), 8)), min_value=1, max_value=24, step=1)
-with c4:
-    max_teams = st.number_input("Equipos/sensores máx.", value=int(_safe_float(params.get("Cantidad de equipos/sensores disponibles"), 2)), min_value=1, step=1)
-with c5:
-    logistic_daily = st.number_input("Costo logístico diario COP", value=int(_safe_float(params.get("Logística de Muestreo (Honorarios, Viáticos y Transporte)"), 0)), min_value=0, step=100_000)
-with c6:
-    reserve_pct = st.number_input("Reserva/imprevistos %", value=0.0, min_value=0.0, max_value=50.0, step=1.0, help="Porcentaje del presupuesto que se deja sin optimizar para imprevistos.")
-
-effective_budget = int(round(float(budget) * (1 - float(reserve_pct) / 100)))
-st.caption(f"Presupuesto optimizable por el solver: ${effective_budget:,.0f} COP. Reserva: ${int(budget) - effective_budget:,.0f} COP.")
-
-st.subheader("Círculos de hadas / perímetros")
-with st.expander("Ver y editar círculos", expanded=False):
-    circles_df = st.data_editor(
-        parsed.circles,
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={"Perimetro_m": st.column_config.NumberColumn("Perímetro (m)", min_value=0.01)},
-    )
-
-st.subheader("Actividades y análisis")
-st.caption("Esta versión no usa mínimos obligatorios. Las cantidades resultan de AHP, presupuesto, geometría, capacidad operativa y conservación de muestras.")
-left, right = st.columns(2)
-with left:
-    st.markdown("**Campo**")
-    field_df = st.data_editor(
-        parsed.field_df,
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={
-            "tiempo_h_por_punto": st.column_config.NumberColumn("Tiempo h/punto", min_value=0),
-            "peso_ahp": st.column_config.NumberColumn("Peso AHP", min_value=0.0, format="%.4f"),
-            "produce_muestra_lab": st.column_config.CheckboxColumn("Produce muestra lab"),
-        },
-    )
-with right:
-    st.markdown("**Laboratorio**")
-    lab_df = st.data_editor(
-        parsed.lab_df,
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={
-            "costo_por_muestra": st.column_config.NumberColumn("Costo/muestra COP", min_value=0, step=100_000),
-            "peso_ahp": st.column_config.NumberColumn("Peso AHP", min_value=0.0, format="%.4f"),
-        },
-    )
-
-# Diagnóstico AHP previo
-try:
-    preview_circles, preview_field_df, preview_lab_df = clean_model_inputs(circles_df, field_df, lab_df)
-except Exception as preview_exc:
-    st.warning(f"Hay filas incompletas o inválidas antes de resolver: {preview_exc}")
-    preview_field_df = field_df.copy()
-    preview_lab_df = lab_df.copy()
-
-field_weight = pd.to_numeric(preview_field_df["peso_ahp"], errors="coerce").fillna(0).sum()
-lab_weight = pd.to_numeric(preview_lab_df["peso_ahp"], errors="coerce").fillna(0).sum()
-total_weight = field_weight + lab_weight
-if total_weight > 0:
-    st.info(
-        f"Objetivo AHP global: Campo = {field_weight / total_weight:.2%}, "
-        f"Laboratorio = {lab_weight / total_weight:.2%}."
-    )
-
-run = st.button("🚀 Ejecutar optimización", type="primary", use_container_width=True)
-
-if run:
-    try:
-        separations = parse_separations(separations_text)
-        with st.spinner("Resolviendo modelo lexicográfico..."):
-            clean_circles_df, clean_field_df, clean_lab_df = clean_model_inputs(circles_df, field_df, lab_df)
-            result = solve_milp_ahp(
-                circles=clean_circles_df,
-                field_df=clean_field_df,
-                lab_df=clean_lab_df,
-                separations=separations,
-                budget_cop=int(effective_budget),
-                days_available=int(days),
-                hours_per_day=int(hours),
-                max_teams=int(max_teams),
-                logistic_daily_cost=int(logistic_daily),
-                n_mode=n_mode_label,
-                lab_cap_enabled=lab_cap_enabled,
-                allow_multiple_activities=allow_multiple,
-                time_limit_per_stage=int(time_limit),
-                relative_tolerance=float(relative_tolerance),
-            )
-    except Exception as exc:
-        st.error(f"Error al resolver: {exc}")
-        st.stop()
-
-    if not result.get("ok"):
-        st.error(result.get("error", "No se encontró solución."))
-        st.dataframe(pd.DataFrame(result.get("logs", [])), use_container_width=True)
-        st.stop()
-
+    Streamlit vuelve a ejecutar el script cuando se interactúa con widgets. Por eso
+    guardamos la solución y los archivos de descarga en st.session_state: así, al
+    descargar el Excel o CSV, la app no pierde el resultado mostrado.
+    """
     if result.get("warning"):
         st.warning(result["warning"])
 
@@ -1028,9 +869,6 @@ if run:
     fig.update_layout(yaxis_tickformat=".0%", yaxis_title="Participación del presupuesto", xaxis_title="")
     st.plotly_chart(fig, use_container_width=True)
 
-    lab_by_circle, lab_long = build_lab_allocation_by_circle(result["plan"], result["lab"], clean_lab_df)
-    excel_report = build_excel_report(result, clean_field_df, clean_lab_df)
-
     tab1, tab2, tab3, tab4 = st.tabs(["Plan por círculo", "Campo", "Laboratorio", "Log solver"])
     with tab1:
         st.dataframe(result["plan"], use_container_width=True)
@@ -1038,10 +876,11 @@ if run:
         with c_csv:
             st.download_button(
                 "Descargar plan CSV",
-                data=result["plan"].to_csv(index=False).encode("utf-8"),
+                data=csv_bytes,
                 file_name="plan_muestreo.csv",
                 mime="text/csv",
                 use_container_width=True,
+                on_click="ignore",
             )
         with c_xlsx:
             st.download_button(
@@ -1050,6 +889,7 @@ if run:
                 file_name="reporte_muestreo_MILP_AHP.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
+                on_click="ignore",
             )
         st.caption("El CSV solo puede contener una tabla. Para tener varias hojas usa el reporte Excel multi-hoja.")
     with tab2:
@@ -1087,6 +927,221 @@ if run:
     with tab4:
         st.dataframe(pd.DataFrame(result.get("logs", [])), use_container_width=True)
         st.json(kpis)
+
+
+st.title("🧪 Optimización MILP-AHP para estrategias de muestreo")
+st.caption("Asignación de recursos entre campo y laboratorio usando prioridades AHP, restricciones geométricas, presupuesto y capacidad operativa.")
+
+with st.sidebar:
+    st.header("1) Datos")
+    st.download_button(
+        "📥 Descargar plantilla Excel",
+        data=build_template_excel_bytes(),
+        file_name="Data_template_MILP_AHP.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        help="Plantilla con hojas Parametros, Circulos, Campo y Laboratorio.",
+        on_click="ignore",
+    )
+    data_mode = st.radio(
+        "Origen de datos",
+        options=["Subir Excel", "Ingresar manualmente"],
+        index=0,
+        help="Puedes cargar un Excel con el formato de la plantilla o ingresar/editar los datos directamente en la app.",
+        key="data_mode",
+    )
+    uploaded = None
+    if data_mode == "Subir Excel":
+        uploaded = st.file_uploader("Carga tu Data.xlsx", type=["xlsx"], key="uploaded_excel")
+
+    st.header("2) Solver")
+    separations_text = st.text_input("Separaciones permitidas en metros", value="10, 20, 50", key="separations_text")
+    n_mode_label = st.selectbox(
+        "Cálculo de puntos por perímetro",
+        options=["floor", "ceil", "round"],
+        index=0,
+        help="floor = cuántos puntos caben sin exceder el perímetro; ceil = cubre todo el perímetro.",
+        key="n_mode_label",
+    )
+    allow_multiple = st.checkbox(
+        "Permitir varias actividades por círculo (formulación Word)",
+        value=True,
+        help="Más fiel al modelo: cada círculo incluido debe tener al menos una actividad, pero no necesariamente muestreo puntual.",
+        key="allow_multiple",
+    )
+    lab_cap_enabled = st.checkbox(
+        "Conservación total de muestras: laboratorio ≤ campo",
+        value=True,
+        help="Impone suma de todos los análisis de laboratorio ≤ muestras físicas recolectadas en actividades marcadas como Produce muestra lab.",
+        key="lab_cap_enabled",
+    )
+    time_limit = st.slider("Tiempo máximo por etapa (s)", min_value=3, max_value=120, value=15, step=1, key="time_limit")
+    relative_tolerance = st.select_slider(
+        "Tolerancia lexicográfica relativa",
+        options=[1e-7, 5e-7, 1e-6, 5e-6, 1e-5, 5e-5, 1e-4],
+        value=1e-6,
+        format_func=lambda x: f"{x:g}",
+        key="relative_tolerance",
+    )
+
+# Carga inicial: Excel o entrada manual.
+if data_mode == "Subir Excel":
+    if uploaded is None:
+        st.info("Carga tu archivo Data.xlsx o descarga la plantilla para llenarla.")
+        if st.session_state.get("last_result"):
+            st.markdown("### Última solución guardada")
+            st.caption("Todavía se muestra porque está guardada en memoria de la sesión.")
+            render_solution(
+                st.session_state["last_result"],
+                st.session_state.get("last_lab_by_circle", pd.DataFrame()),
+                st.session_state.get("last_excel_report", b""),
+                st.session_state.get("last_csv", b""),
+            )
+        st.stop()
+    try:
+        parsed = parse_excel(uploaded)
+    except Exception as exc:
+        st.error(f"No pude leer el Excel: {exc}")
+        st.stop()
+else:
+    parsed = default_manual_data()
+    st.info("Modo manual activo: edita las tablas directamente en la app. También puedes descargar la plantilla si prefieres preparar los datos en Excel.")
+
+params = parsed.params
+
+st.subheader("Parámetros generales")
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+with c1:
+    budget = st.number_input("Presupuesto total COP", value=int(_safe_float(params.get("Presupuesto Total Disponible"), 0)), min_value=1, step=1_000_000, key="budget")
+with c2:
+    days = st.number_input("Días disponibles", value=int(_safe_float(params.get("Tiempo total disponible para el muestreo"), 60)), min_value=1, step=1, key="days")
+with c3:
+    hours = st.number_input("Horas/día", value=int(_safe_float(params.get("Horas efectivas de trabajo del equipo por día"), 8)), min_value=1, max_value=24, step=1, key="hours")
+with c4:
+    max_teams = st.number_input("Equipos/sensores máx.", value=int(_safe_float(params.get("Cantidad de equipos/sensores disponibles"), 2)), min_value=1, step=1, key="max_teams")
+with c5:
+    logistic_daily = st.number_input("Costo logístico diario COP", value=int(_safe_float(params.get("Logística de Muestreo (Honorarios, Viáticos y Transporte)"), 0)), min_value=0, step=100_000, key="logistic_daily")
+with c6:
+    reserve_pct = st.number_input("Reserva/imprevistos %", value=0.0, min_value=0.0, max_value=50.0, step=1.0, help="Porcentaje del presupuesto que se deja sin optimizar para imprevistos.", key="reserve_pct")
+
+effective_budget = int(round(float(budget) * (1 - float(reserve_pct) / 100)))
+st.caption(f"Presupuesto optimizable por el solver: ${effective_budget:,.0f} COP. Reserva: ${int(budget) - effective_budget:,.0f} COP.")
+
+st.subheader("Círculos de hadas / perímetros")
+with st.expander("Ver y editar círculos", expanded=False):
+    circles_df = st.data_editor(
+        parsed.circles,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={"Perimetro_m": st.column_config.NumberColumn("Perímetro (m)", min_value=0.01)},
+        key="circles_editor",
+    )
+
+st.subheader("Actividades y análisis")
+st.caption("Esta versión no usa mínimos obligatorios. Las cantidades resultan de AHP, presupuesto, geometría, capacidad operativa y conservación de muestras.")
+left, right = st.columns(2)
+with left:
+    st.markdown("**Campo**")
+    field_df = st.data_editor(
+        parsed.field_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "tiempo_h_por_punto": st.column_config.NumberColumn("Tiempo h/punto", min_value=0),
+            "peso_ahp": st.column_config.NumberColumn("Peso AHP", min_value=0.0, format="%.4f"),
+            "produce_muestra_lab": st.column_config.CheckboxColumn("Produce muestra lab"),
+        },
+        key="field_editor",
+    )
+with right:
+    st.markdown("**Laboratorio**")
+    lab_df = st.data_editor(
+        parsed.lab_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "costo_por_muestra": st.column_config.NumberColumn("Costo/muestra COP", min_value=0, step=100_000),
+            "peso_ahp": st.column_config.NumberColumn("Peso AHP", min_value=0.0, format="%.4f"),
+        },
+        key="lab_editor",
+    )
+
+# Diagnóstico AHP previo
+try:
+    preview_circles, preview_field_df, preview_lab_df = clean_model_inputs(circles_df, field_df, lab_df)
+except Exception as preview_exc:
+    st.warning(f"Hay filas incompletas o inválidas antes de resolver: {preview_exc}")
+    preview_field_df = field_df.copy()
+    preview_lab_df = lab_df.copy()
+
+field_weight = pd.to_numeric(preview_field_df["peso_ahp"], errors="coerce").fillna(0).sum()
+lab_weight = pd.to_numeric(preview_lab_df["peso_ahp"], errors="coerce").fillna(0).sum()
+total_weight = field_weight + lab_weight
+if total_weight > 0:
+    st.info(
+        f"Objetivo AHP global: Campo = {field_weight / total_weight:.2%}, "
+        f"Laboratorio = {lab_weight / total_weight:.2%}."
+    )
+
+run = st.button("🚀 Ejecutar optimización", type="primary", use_container_width=True, key="run_optimization")
+
+if run:
+    try:
+        separations = parse_separations(separations_text)
+        with st.spinner("Resolviendo modelo lexicográfico..."):
+            clean_circles_df, clean_field_df, clean_lab_df = clean_model_inputs(circles_df, field_df, lab_df)
+            result = solve_milp_ahp(
+                circles=clean_circles_df,
+                field_df=clean_field_df,
+                lab_df=clean_lab_df,
+                separations=separations,
+                budget_cop=int(effective_budget),
+                days_available=int(days),
+                hours_per_day=int(hours),
+                max_teams=int(max_teams),
+                logistic_daily_cost=int(logistic_daily),
+                n_mode=n_mode_label,
+                lab_cap_enabled=lab_cap_enabled,
+                allow_multiple_activities=allow_multiple,
+                time_limit_per_stage=int(time_limit),
+                relative_tolerance=float(relative_tolerance),
+            )
+    except Exception as exc:
+        st.error(f"Error al resolver: {exc}")
+        st.stop()
+
+    if not result.get("ok"):
+        st.error(result.get("error", "No se encontró solución."))
+        st.dataframe(pd.DataFrame(result.get("logs", [])), use_container_width=True)
+        st.stop()
+
+    lab_by_circle, lab_long = build_lab_allocation_by_circle(result["plan"], result["lab"], clean_lab_df)
+    excel_report = build_excel_report(result, clean_field_df, clean_lab_df)
+    csv_bytes = result["plan"].to_csv(index=False).encode("utf-8")
+
+    st.session_state["last_result"] = result
+    st.session_state["last_lab_by_circle"] = lab_by_circle
+    st.session_state["last_excel_report"] = excel_report
+    st.session_state["last_csv"] = csv_bytes
+    st.session_state["last_clean_field_df"] = clean_field_df
+    st.session_state["last_clean_lab_df"] = clean_lab_df
+
+if st.session_state.get("last_result"):
+    top_left, top_right = st.columns([3, 1])
+    with top_left:
+        st.markdown("## Resultado de optimización")
+        st.caption("El resultado queda guardado en la sesión, por lo que descargar el Excel/CSV no borra la solución mostrada.")
+    with top_right:
+        if st.button("Borrar resultado guardado", use_container_width=True, key="clear_result"):
+            for key in ["last_result", "last_lab_by_circle", "last_excel_report", "last_csv", "last_clean_field_df", "last_clean_lab_df"]:
+                st.session_state.pop(key, None)
+            st.rerun()
+    render_solution(
+        st.session_state["last_result"],
+        st.session_state.get("last_lab_by_circle", pd.DataFrame()),
+        st.session_state.get("last_excel_report", b""),
+        st.session_state.get("last_csv", b""),
+    )
 else:
     st.markdown(
         """
