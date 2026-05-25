@@ -38,6 +38,13 @@ if "last_solution_bundle" not in st.session_state:
 
 SHIFTS = ["Dia", "Noche"]
 W_SCALE = 10_000
+# Tolerancia interna para la fijación lexicográfica de Z1/Z2.
+# La formulación exige maximizar C_used después de lograr la coherencia AHP.
+# En CP-SAT, fijar Z1 y Z2 con igualdad exacta puede bloquear el uso del presupuesto
+# por la discretización de muestras/costos. Por eso la etapa 3 usa una tolerancia
+# muy pequeña de conservación de coherencia para poder exprimir el presupuesto.
+LEXI_TOL_PCT = 0.0025  # 0.25 % del presupuesto, expresado en unidades escaladas
+TARGET_BUDGET_USE = 0.995  # se considera saturado si usa al menos 99.5 %
 
 
 @dataclass
@@ -359,8 +366,8 @@ def model_equations_table() -> pd.DataFrame:
         ("AHP campo", "C_f+d_f- - d_f+ = alpha_f*C_field"),
         ("AHP lab", "C_k+u_k- - u_k+ = gamma_k*C_lab  para todo k"),
         ("Etapa 1", "min Z1 = eF-+eF+ + eL-+eL+"),
-        ("Etapa 2", "min Z2 = sum_f(d_f-+d_f+) + sum_k(u_k-+u_k+) sujeto a Z1=Z1*"),
-        ("Etapa 3", "max C_used sujeto a Z1=Z1* y Z2=Z2*"),
+        ("Etapa 2", "min Z2 = sum_f(d_f-+d_f+) + sum_k(u_k-+u_k+) sujeto a Z1 <= Z1* + epsilon1"),
+        ("Etapa 3", "max C_used sujeto a Z1 <= Z1* + epsilon1 y Z2 <= Z2* + epsilon2"),
     ]
     return pd.DataFrame(rows, columns=["Bloque", "Ecuación implementada"])
 
@@ -649,6 +656,7 @@ def solve_milp_ahp_word(
                 "Z2 campo aprox COP": int(solver.Value(Z2_field)) / W_SCALE,
                 "Z2 laboratorio aprox COP": int(solver.Value(Z2_lab)) / W_SCALE,
                 "Uso presupuesto %": cused_val / max(1, budget),
+                "Presupuesto no usado": max(0, budget - cused_val),
                 "Campo real %": cfield_val / max(1, cused_val),
                 "Lab real %": clab_val / max(1, cused_val),
                 "Campo objetivo AHP %": beta["Campo"] / W_SCALE,
@@ -670,11 +678,18 @@ def solve_milp_ahp_word(
     best_solution = extract("Etapa 1", status1)
     z1_value = int(solver.Value(Z1))
 
-    # Etapa 2: fijar Z1* y min Z2
-    model.Add(Z1 == z1_value)
+    # Tolerancias de fijación lexicográfica en unidades escaladas.
+    # No son parámetros del modelo conceptual: son una protección numérica para que
+    # la etapa 3 pueda cumplir el mandato del Word de maximizar C_used.
+    z_tol = max(W_SCALE, int(round(budget * W_SCALE * LEXI_TOL_PCT)))
+
+    # Etapa 2: conservar el óptimo global de AHP dentro de tolerancia y min Z2.
+    # Se usa <= en vez de igualdad exacta para evitar que la discretización bloquee
+    # soluciones equivalentes desde el punto de vista operativo.
+    model.Add(Z1 <= z1_value + z_tol)
     model.Minimize(Z2)
     status2 = solver.Solve(model)
-    logs.append({"etapa": "2. Minimización de desviaciones internas con Z1=Z1*", "estado": status_name(status2)})
+    logs.append({"etapa": "2. Minimización de desviaciones internas con Z1≈Z1*", "estado": status_name(status2)})
     if not is_good(status2):
         best_solution["warning"] = "La etapa 2 no encontró solución; se muestra etapa 1."
         best_solution["logs"] = logs
@@ -684,16 +699,15 @@ def solve_milp_ahp_word(
     z2_field_value = int(solver.Value(Z2_field))
     z2_lab_value = int(solver.Value(Z2_lab))
 
-    # Etapa 3: fijar Z1*, Z2* y max Cused.
-    # Además, se fijan los componentes Z2_field y Z2_lab logrados en la etapa 2
-    # para evitar que la maximización final del presupuesto intercambie desviación
-    # entre campo y laboratorio manteniendo solo el mismo Z2 total.
-    model.Add(Z2 == z2_value)
-    model.Add(Z2_field == z2_field_value)
-    model.Add(Z2_lab == z2_lab_value)
+    # Etapa 3: maximizar C_used manteniendo la coherencia AHP lograda.
+    # La formulación ordena exprimir el presupuesto al máximo posible.
+    # Por eso NO se vuelve a minimizar Z1/Z2 aquí; el objetivo operativo es C_used.
+    model.Add(Z2 <= z2_value + z_tol)
+    model.Add(Z2_field <= z2_field_value + z_tol)
+    model.Add(Z2_lab <= z2_lab_value + z_tol)
     model.Maximize(Cused)
     status3 = solver.Solve(model)
-    logs.append({"etapa": "3. Maximización de presupuesto usado con Z1=Z1* y Z2=Z2*", "estado": status_name(status3)})
+    logs.append({"etapa": "3. Maximización de presupuesto usado con coherencia AHP preservada", "estado": status_name(status3)})
     if not is_good(status3):
         best_solution["warning"] = "La etapa 3 no encontró solución; se muestra etapa 2."
         best_solution["logs"] = logs
@@ -701,6 +715,13 @@ def solve_milp_ahp_word(
 
     final_solution = extract("Etapa 3", status3)
     final_solution["logs"] = logs
+    if final_solution["kpis"]["Uso presupuesto %"] < TARGET_BUDGET_USE:
+        final_solution["warning"] = (
+            "La etapa 3 maximizó el presupuesto usado, pero no alcanzó 99.5 %. "
+            "Con los datos actuales, el presupuesto restante no puede gastarse sin romper alguna "
+            "restricción activa del modelo: capacidad por turnos, conservación de muestras, "
+            "integralidad geométrica, costos discretos o coherencia AHP preservada."
+        )
     return {"ok": True, **final_solution}
 
 
@@ -709,7 +730,7 @@ def solve_milp_ahp_word(
 # -----------------------------
 
 st.title("🧪 Optimización MILP-AHP para estrategias de muestreo")
-st.caption("Versión estricta basada únicamente en la formulación Word: turnos Día/Noche, sin mínimos, sin reserva y sin selector de producción de muestra.")
+st.caption("Versión basada en la formulación Word: turnos Día/Noche, sin mínimos, sin reserva, sin selector de producción de muestra y con etapa 3 orientada a maximizar presupuesto usado.")
 
 with st.sidebar:
     st.header("1) Datos")
@@ -896,6 +917,8 @@ if bundle is not None:
     kpis = result["kpis"]
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Presupuesto usado", f"${kpis['Presupuesto usado']:,.0f}", f"{kpis['Uso presupuesto %']:.1%}")
+    if kpis.get("Presupuesto no usado", 0) > 0:
+        st.caption(f"Presupuesto no usado: ${kpis['Presupuesto no usado']:,.0f}")
     k2.metric("Campo", f"${kpis['Gasto campo']:,.0f}", f"{kpis['Campo real %']:.1%}")
     k3.metric("Laboratorio", f"${kpis['Gasto laboratorio']:,.0f}", f"{kpis['Lab real %']:.1%}")
     k4.metric("Equipos Día/Noche", f"{kpis['Equipos dia']} / {kpis['Equipos noche']}")
