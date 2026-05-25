@@ -33,7 +33,7 @@ if "last_solution_bundle" not in st.session_state:
 # - no usa reserva/imprevistos
 # - no usa selector floor/ceil/round: aplica n_i,s = max(1, floor(P_i/s))
 # - no permite cambiar la lógica de activación del círculo
-# - conservación de muestras: L_k <= sum_f Q_f para cada k
+# - conservación de muestras: sum_k L_k <= sum_f Q_f
 # =========================================================
 
 SHIFTS = ["Dia", "Noche"]
@@ -116,7 +116,7 @@ def build_template_excel_bytes() -> bytes:
             {"Hoja": "Separaciones", "Descripcion": "Conjunto S. Columna: separacion_m."},
             {"Hoja": "Campo", "Descripcion": "Conjunto F. Columnas: actividad, alpha_f, t_Dia_h, t_Noche_h, c_h_Dia_COP_h, c_h_Noche_COP_h. No hay mínimos ni produce_muestra_lab."},
             {"Hoja": "Laboratorio", "Descripcion": "Conjunto K. Columnas: analisis, gamma_k, c_lab_COP_muestra."},
-            {"Hoja": "Modelo", "Descripcion": "Conservación: L_k <= sum_f Q_f para cada análisis k. Todas las actividades de campo aportan a sum_f Q_f."},
+            {"Hoja": "Modelo", "Descripcion": "Conservación: sum_k L_k <= sum_f Q_f. Todas las actividades de campo aportan a sum_f Q_f."},
         ])
         notes.to_excel(writer, sheet_name="Notas_formato", index=False)
         for ws in writer.book.worksheets:
@@ -354,10 +354,10 @@ def model_equations_table() -> pd.DataFrame:
         ("Presupuesto", "C_used <= C_total"),
         ("Capacidad", "sum_f t_f,w * Q_f <= E_w * T_max * H_turno  para todo w"),
         ("Equipos", "E_w <= E_max  para todo w"),
-        ("Conservación", "L_k <= sum_f Q_f  para todo k"),
+        ("Conservación", "sum_k L_k <= sum_f Q_f"),
         ("AHP global", "C_field+eF- - eF+ = beta_F*C_used; C_lab+eL- - eL+ = beta_L*C_used"),
         ("AHP campo", "C_f+d_f- - d_f+ = alpha_f*C_field"),
-        ("AHP lab", "C_k+u_k- - u_k+ = gamma_k*C_lab"),
+        ("AHP lab", "C_k+u_k- - u_k+ = gamma_k*C_lab  para todo k"),
         ("Etapa 1", "min Z1 = eF-+eF+ + eL-+eL+"),
         ("Etapa 2", "min Z2 = sum_f(d_f-+d_f+) + sum_k(u_k-+u_k+) sujeto a Z1=Z1*"),
         ("Etapa 3", "max C_used sujeto a Z1=Z1* y Z2=Z2*"),
@@ -517,10 +517,11 @@ def solve_milp_ahp_word(
         # 4.9 límite de equipos
         model.Add(E[w] <= int(max_teams))
 
-    # 4.13 Conservación de muestras: L_k <= sum_f Q_f para cada k
+    # 4.13 Conservación de muestras: el TOTAL de análisis de laboratorio
+    # no puede exceder el TOTAL de muestras de campo recolectadas.
+    # Todas las actividades de campo aportan a sum_f Q_f.
     total_field_samples = sum(Q[f] for f in F)
-    for k in K:
-        model.Add(L[k] <= total_field_samples)
+    model.Add(sum(L[k] for k in K) <= total_field_samples)
 
     # Desviaciones AHP con variables explícitas, como en el Word.
     max_dev = max(1, budget * W_SCALE)
@@ -535,19 +536,27 @@ def solve_milp_ahp_word(
 
     d_minus, d_plus = {}, {}
     u_minus, u_plus = {}, {}
-    local_dev_terms = []
+    field_dev_terms = []
+    lab_dev_terms = []
     for f in F:
         d_minus[f] = model.NewIntVar(0, max_dev, f"d_minus__{f}")
         d_plus[f] = model.NewIntVar(0, max_dev, f"d_plus__{f}")
         model.Add(W_SCALE * Cf[f] + d_minus[f] - d_plus[f] == alpha[f] * Cfield)
-        local_dev_terms.extend([d_minus[f], d_plus[f]])
+        field_dev_terms.extend([d_minus[f], d_plus[f]])
     for k in K:
         u_minus[k] = model.NewIntVar(0, max_dev, f"u_minus__{k}")
         u_plus[k] = model.NewIntVar(0, max_dev, f"u_plus__{k}")
         model.Add(W_SCALE * Ck[k] + u_minus[k] - u_plus[k] == gamma[k] * Clab)
-        local_dev_terms.extend([u_minus[k], u_plus[k]])
-    Z2 = model.NewIntVar(0, len(local_dev_terms) * max_dev, "Z2")
-    model.Add(Z2 == sum(local_dev_terms))
+        lab_dev_terms.extend([u_minus[k], u_plus[k]])
+
+    # Se separa el componente de campo y laboratorio para poder diagnosticar
+    # específicamente la calidad de la asignación local en laboratorio.
+    Z2_field = model.NewIntVar(0, len(field_dev_terms) * max_dev, "Z2_field")
+    Z2_lab = model.NewIntVar(0, len(lab_dev_terms) * max_dev, "Z2_lab")
+    model.Add(Z2_field == sum(field_dev_terms))
+    model.Add(Z2_lab == sum(lab_dev_terms))
+    Z2 = model.NewIntVar(0, (len(field_dev_terms) + len(lab_dev_terms)) * max_dev, "Z2")
+    model.Add(Z2 == Z2_field + Z2_lab)
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = max(1, int(time_limit_per_stage))
@@ -585,12 +594,17 @@ def solve_milp_ahp_word(
         lab_rows = []
         for k in K:
             cost = int(solver.Value(Ck[k]))
+            target_cost = (gamma[k] / W_SCALE) * clab_val
+            deviation_cost = abs(cost - target_cost)
             lab_rows.append({
                 "analisis": k,
                 "muestras_L": int(solver.Value(L[k])),
                 "costo_COP": cost,
                 "gamma_k": gamma[k] / W_SCALE,
+                "participacion_objetivo_lab": gamma[k] / W_SCALE,
                 "participacion_real_lab": cost / max(1, clab_val),
+                "costo_objetivo_AHP_COP": int(round(target_cost)),
+                "desviacion_abs_COP": int(round(deviation_cost)),
             })
 
         plan_rows = []
@@ -632,6 +646,8 @@ def solve_milp_ahp_word(
                 "Muestras laboratorio totales": int(sum(int(solver.Value(L[k])) for k in K)),
                 "Z1 aprox COP": int(solver.Value(Z1)) / W_SCALE,
                 "Z2 aprox COP": int(solver.Value(Z2)) / W_SCALE,
+                "Z2 campo aprox COP": int(solver.Value(Z2_field)) / W_SCALE,
+                "Z2 laboratorio aprox COP": int(solver.Value(Z2_lab)) / W_SCALE,
                 "Uso presupuesto %": cused_val / max(1, budget),
                 "Campo real %": cfield_val / max(1, cused_val),
                 "Lab real %": clab_val / max(1, cused_val),
@@ -665,9 +681,16 @@ def solve_milp_ahp_word(
         return {"ok": True, **best_solution}
     best_solution = extract("Etapa 2", status2)
     z2_value = int(solver.Value(Z2))
+    z2_field_value = int(solver.Value(Z2_field))
+    z2_lab_value = int(solver.Value(Z2_lab))
 
-    # Etapa 3: fijar Z1*, Z2* y max Cused
+    # Etapa 3: fijar Z1*, Z2* y max Cused.
+    # Además, se fijan los componentes Z2_field y Z2_lab logrados en la etapa 2
+    # para evitar que la maximización final del presupuesto intercambie desviación
+    # entre campo y laboratorio manteniendo solo el mismo Z2 total.
     model.Add(Z2 == z2_value)
+    model.Add(Z2_field == z2_field_value)
+    model.Add(Z2_lab == z2_lab_value)
     model.Maximize(Cused)
     status3 = solver.Solve(model)
     logs.append({"etapa": "3. Maximización de presupuesto usado con Z1=Z1* y Z2=Z2*", "estado": status_name(status3)})
@@ -760,7 +783,7 @@ with st.expander("S: Separaciones permitidas", expanded=False):
 left, right = st.columns(2)
 with left:
     st.markdown("### F: Actividades de campo")
-    st.caption("No hay mínimos y no se pregunta si produce muestra: toda Q_f cuenta para la restricción L_k ≤ ΣQ_f.")
+    st.caption("No hay mínimos y no se pregunta si produce muestra: toda Q_f cuenta para la restricción Σ_k L_k ≤ Σ_f Q_f.")
     field_df = st.data_editor(
         parsed.field_df,
         num_rows="dynamic",
@@ -924,6 +947,7 @@ if bundle is not None:
             st.plotly_chart(fig_f, use_container_width=True)
     with tab3:
         st.markdown("**Resumen global de laboratorio**")
+        st.caption("La aproximación AHP local de laboratorio se evalúa sobre el gasto C_k/Clab, no sobre el número de muestras L_k. Por eso la tabla incluye costo objetivo y desviación en COP.")
         st.dataframe(result["lab"], use_container_width=True)
         st.markdown("**Asignación sugerida de laboratorio por círculo**")
         st.caption(
@@ -934,7 +958,7 @@ if bundle is not None:
         if not result["lab"].empty:
             lab_plot = result["lab"].melt(
                 id_vars="analisis",
-                value_vars=["gamma_k", "participacion_real_lab"],
+                value_vars=["participacion_objetivo_lab", "participacion_real_lab"],
                 var_name="tipo",
                 value_name="valor",
             )
