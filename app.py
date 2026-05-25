@@ -40,18 +40,18 @@ GENERAL_PARAM_ROWS = [
 ]
 
 DEFAULT_FIELD_ROWS = [
-    {"actividad": "Muestreo puntual estándar", "tiempo_h_por_punto": 1, "peso_ahp": 0.2417, "minimo": 69, "produce_muestra_lab": True},
-    {"actividad": "Muestreo multinivel", "tiempo_h_por_punto": 3, "peso_ahp": 0.2029, "minimo": 90, "produce_muestra_lab": True},
-    {"actividad": "Medición 24 horas", "tiempo_h_por_punto": 25, "peso_ahp": 0.1459, "minimo": 10, "produce_muestra_lab": False},
-    {"actividad": "Medición extendida", "tiempo_h_por_punto": 121, "peso_ahp": 0.0523, "minimo": 2, "produce_muestra_lab": False},
+    {"actividad": "Muestreo puntual estándar", "tiempo_h_por_punto": 1, "peso_ahp": 0.2417, "produce_muestra_lab": True},
+    {"actividad": "Muestreo multinivel", "tiempo_h_por_punto": 3, "peso_ahp": 0.2029, "produce_muestra_lab": True},
+    {"actividad": "Medición 24 horas", "tiempo_h_por_punto": 25, "peso_ahp": 0.1459, "produce_muestra_lab": False},
+    {"actividad": "Medición extendida", "tiempo_h_por_punto": 121, "peso_ahp": 0.0523, "produce_muestra_lab": False},
 ]
 
 DEFAULT_LAB_ROWS = [
-    {"analisis": "Cromatografía de Gas", "costo_por_muestra": 1190000, "peso_ahp": 0.1511, "minimo": 15},
-    {"analisis": "Isotopía de Deuterio", "costo_por_muestra": 6538812, "peso_ahp": 0.0897, "minimo": 5},
-    {"analisis": "Isotopía de Helio", "costo_por_muestra": 6538812, "peso_ahp": 0.0438, "minimo": 5},
-    {"analisis": "Caracterización mineralógica", "costo_por_muestra": 1953385, "peso_ahp": 0.0399, "minimo": 15},
-    {"analisis": "Biogeoquímica", "costo_por_muestra": 3015249, "peso_ahp": 0.0328, "minimo": 15},
+    {"analisis": "Cromatografía de Gas", "costo_por_muestra": 1190000, "peso_ahp": 0.1511},
+    {"analisis": "Isotopía de Deuterio", "costo_por_muestra": 6538812, "peso_ahp": 0.0897},
+    {"analisis": "Isotopía de Helio", "costo_por_muestra": 6538812, "peso_ahp": 0.0438},
+    {"analisis": "Caracterización mineralógica", "costo_por_muestra": 1953385, "peso_ahp": 0.0399},
+    {"analisis": "Biogeoquímica", "costo_por_muestra": 3015249, "peso_ahp": 0.0328},
 ]
 
 
@@ -88,7 +88,7 @@ def build_template_excel_bytes() -> bytes:
             {"Hoja": "Parametros", "Descripcion": "Parámetros generales del modelo. Debe conservar columnas: Parametro, Unidad, Valor."},
             {"Hoja": "Circulos", "Descripcion": "Lista de círculos de hadas. Debe conservar columnas: ID, Perimetro_m."},
             {"Hoja": "Campo", "Descripcion": "Actividades de campo. produce_muestra_lab=True si cada punto genera una muestra física para laboratorio."},
-            {"Hoja": "Laboratorio", "Descripcion": "Tipos de análisis de laboratorio, costo por muestra, peso AHP y mínimo opcional."},
+            {"Hoja": "Laboratorio", "Descripcion": "Tipos de análisis de laboratorio, costo por muestra y peso AHP."},
             {"Hoja": "Importante", "Descripcion": "La restricción actual usa conservación total: suma de muestras de laboratorio <= muestras físicas recolectadas en campo."},
         ])
         notes.to_excel(writer, sheet_name="Notas_formato", index=False)
@@ -140,25 +140,25 @@ def clean_model_inputs(
     circles = circles.drop_duplicates(subset=["ID"], keep="first").reset_index(drop=True)
 
     # Actividades de campo válidas.
-    required_field = ["actividad", "tiempo_h_por_punto", "peso_ahp", "minimo", "produce_muestra_lab"]
+    required_field = ["actividad", "tiempo_h_por_punto", "peso_ahp", "produce_muestra_lab"]
     for col in required_field:
         if col not in field_df.columns:
             field_df[col] = False if col == "produce_muestra_lab" else 0
     field_df["actividad"] = _clean_name_series(field_df["actividad"])
     field_df = field_df[field_df["actividad"] != ""].copy()
-    for col in ["tiempo_h_por_punto", "peso_ahp", "minimo"]:
+    for col in ["tiempo_h_por_punto", "peso_ahp"]:
         field_df[col] = pd.to_numeric(field_df[col], errors="coerce").fillna(0)
     field_df["produce_muestra_lab"] = field_df["produce_muestra_lab"].fillna(False).astype(bool)
     field_df = field_df[field_df["tiempo_h_por_punto"] > 0].reset_index(drop=True)
 
     # Análisis de laboratorio válidos.
-    required_lab = ["analisis", "costo_por_muestra", "peso_ahp", "minimo"]
+    required_lab = ["analisis", "costo_por_muestra", "peso_ahp"]
     for col in required_lab:
         if col not in lab_df.columns:
             lab_df[col] = 0
     lab_df["analisis"] = _clean_name_series(lab_df["analisis"])
     lab_df = lab_df[lab_df["analisis"] != ""].copy()
-    for col in ["costo_por_muestra", "peso_ahp", "minimo"]:
+    for col in ["costo_por_muestra", "peso_ahp"]:
         lab_df[col] = pd.to_numeric(lab_df[col], errors="coerce").fillna(0)
     lab_df = lab_df[lab_df["costo_por_muestra"] >= 0].reset_index(drop=True)
 
@@ -199,14 +199,27 @@ def _parse_new_template(xls: pd.ExcelFile) -> ParsedData:
     lab_df = xls.parse(sheet_map["laboratorio"])
 
     # Normalizar columnas esperadas del formato nuevo.
-    field_expected = ["actividad", "tiempo_h_por_punto", "peso_ahp", "minimo", "produce_muestra_lab"]
-    lab_expected = ["analisis", "costo_por_muestra", "peso_ahp", "minimo"]
-    if len(field_df.columns) >= len(field_expected):
+    # v4 ya no usa mínimos; por compatibilidad, si el Excel antiguo trae una columna minimo, se ignora.
+    field_expected = ["actividad", "tiempo_h_por_punto", "peso_ahp", "produce_muestra_lab"]
+    field_legacy = ["actividad", "tiempo_h_por_punto", "peso_ahp", "minimo", "produce_muestra_lab"]
+    lab_expected = ["analisis", "costo_por_muestra", "peso_ahp"]
+    lab_legacy = ["analisis", "costo_por_muestra", "peso_ahp", "minimo"]
+
+    if len(field_df.columns) >= len(field_legacy):
+        field_df = field_df.iloc[:, :len(field_legacy)].copy()
+        field_df.columns = field_legacy
+        field_df = field_df[field_expected]
+    elif len(field_df.columns) >= len(field_expected):
         field_df = field_df.iloc[:, :len(field_expected)].copy()
         field_df.columns = field_expected
     else:
         raise ValueError(f"La hoja Campo debe tener columnas: {', '.join(field_expected)}")
-    if len(lab_df.columns) >= len(lab_expected):
+
+    if len(lab_df.columns) >= len(lab_legacy):
+        lab_df = lab_df.iloc[:, :len(lab_legacy)].copy()
+        lab_df.columns = lab_legacy
+        lab_df = lab_df[lab_expected]
+    elif len(lab_df.columns) >= len(lab_expected):
         lab_df = lab_df.iloc[:, :len(lab_expected)].copy()
         lab_df.columns = lab_expected
     else:
@@ -237,28 +250,24 @@ def _parse_legacy_excel(xls: pd.ExcelFile) -> ParsedData:
                 "actividad": "Muestreo puntual estándar",
                 "tiempo_h_por_punto": _safe_float(params.get("Tiempo requerido para tomar un muestreo puntual estándar"), 1),
                 "peso_ahp": _safe_float(params.get("Calidad de un punto de muestreo estándar"), 0.0),
-                "minimo": _safe_float(params.get("Candidatos de muestreo - Teledetección"), 0.0),
                 "produce_muestra_lab": True,
             },
             {
                 "actividad": "Muestreo multinivel",
                 "tiempo_h_por_punto": _safe_float(params.get("Tiempo requerido para hacer un muestreo multinivel"), 3),
                 "peso_ahp": _safe_float(params.get("Calidad de un punto multinivel"), 0.0),
-                "minimo": _safe_float(params.get("Puntos multinivel mínimos por círculo de hadas"), 0.0) * max(len(circles), 1),
                 "produce_muestra_lab": True,
             },
             {
                 "actividad": "Medición 24 horas",
                 "tiempo_h_por_punto": _safe_float(params.get("Tiempo que consume una medición de 24 horas"), 25),
                 "peso_ahp": _safe_float(params.get("Calidad de una medición de 24 horas"), 0.0),
-                "minimo": _safe_float(params.get("Mediciones de 24 horas mínimas en toda la estrategia"), 0.0),
                 "produce_muestra_lab": False,
             },
             {
                 "actividad": "Medición extendida",
                 "tiempo_h_por_punto": _safe_float(params.get("Tiempo que consume una medición extendida (5 días)"), 121),
                 "peso_ahp": _safe_float(params.get("Calidad de una medición extendida"), 0.0),
-                "minimo": _safe_float(params.get("Mediciones extendidas mínimas en toda la estrategia"), 0.0),
                 "produce_muestra_lab": False,
             },
         ]
@@ -271,31 +280,26 @@ def _parse_legacy_excel(xls: pd.ExcelFile) -> ParsedData:
                 "analisis": "Cromatografía de Gas",
                 "costo_por_muestra": _safe_float(params.get("Análisis de Cromatrografía de Gas"), 0.0),
                 "peso_ahp": _safe_float(params.get("Calidad de cromatografia"), 0.0),
-                "minimo": _safe_float(params.get("Muestras mínimas para cromatografia"), 0.0),
             },
             {
                 "analisis": "Isotopía de Deuterio",
                 "costo_por_muestra": isotopic_cost,
                 "peso_ahp": _safe_float(params.get("Calidad de isotopia de Deuterio"), 0.0),
-                "minimo": _safe_float(params.get("Muestras mínimas para isotopia de Deuterio"), 0.0),
             },
             {
                 "analisis": "Isotopía de Helio",
                 "costo_por_muestra": isotopic_cost,
                 "peso_ahp": _safe_float(params.get("Calidad de isotopia de Helio"), 0.0),
-                "minimo": _safe_float(params.get("Muestras mínimas para isotopia de Helio"), 0.0),
             },
             {
                 "analisis": "Caracterización mineralógica",
                 "costo_por_muestra": _safe_float(params.get("Caracterización Mineralógica"), 0.0),
                 "peso_ahp": _safe_float(params.get("Calidad de caracterizacion mineralogica"), 0.0),
-                "minimo": _safe_float(params.get("Muestras mínimas para caracterizacion mineralogica"), 0.0),
             },
             {
                 "analisis": "Biogeoquímica",
                 "costo_por_muestra": _safe_float(params.get("Análisis Biogeoquímico"), 0.0),
                 "peso_ahp": _safe_float(params.get("Calidad de biogeoquimica"), 0.0),
-                "minimo": _safe_float(params.get("Muestras mínimas para biogeoquimica"), 0.0),
             },
         ]
     )
@@ -570,7 +574,6 @@ def solve_milp_ahp(
     max_teams: int,
     logistic_daily_cost: int,
     n_mode: str,
-    enforce_minimums: bool,
     lab_cap_enabled: bool,
     allow_multiple_activities: bool,
     time_limit_per_stage: int,
@@ -584,9 +587,9 @@ def solve_milp_ahp(
     circles, field_df, lab_df = clean_model_inputs(circles, field_df, lab_df)
 
     # Limpieza numérica adicional: evita NaN cuando Streamlit deja celdas vacías.
-    for col in ["tiempo_h_por_punto", "peso_ahp", "minimo"]:
+    for col in ["tiempo_h_por_punto", "peso_ahp"]:
         field_df[col] = pd.to_numeric(field_df[col], errors="coerce").fillna(0)
-    for col in ["costo_por_muestra", "peso_ahp", "minimo"]:
+    for col in ["costo_por_muestra", "peso_ahp"]:
         lab_df[col] = pd.to_numeric(lab_df[col], errors="coerce").fillna(0)
 
     F = field_df["actividad"].tolist()
@@ -669,14 +672,6 @@ def solve_milp_ahp(
     # Capacidad operativa
     model.Add(sum(t[f] * Q[f] for f in F) <= E * days_available * hours_per_day)
 
-    # Mínimos opcionales
-    if enforce_minimums:
-        for _, row in field_df.iterrows():
-            if row["minimo"] > 0:
-                model.Add(Q[row["actividad"]] >= int(round(row["minimo"])))
-        for _, row in lab_df.iterrows():
-            if row["minimo"] > 0:
-                model.Add(L[row["analisis"]] >= int(round(row["minimo"])))
 
     # Conservación de muestras opcional:
     # el total de análisis de laboratorio no puede superar las muestras físicas producidas en campo.
@@ -874,11 +869,6 @@ with st.sidebar:
         value=True,
         help="Más fiel al modelo: cada círculo incluido debe tener al menos una actividad, pero no necesariamente muestreo puntual.",
     )
-    enforce_minimums = st.checkbox(
-        "Activar mínimos del Excel/manual",
-        value=False,
-        help="El modelo base no fuerza mínimos por actividad; puedes activarlos si quieres que se respeten los mínimos cargados.",
-    )
     lab_cap_enabled = st.checkbox(
         "Conservación total de muestras: laboratorio ≤ campo",
         value=True,
@@ -936,6 +926,7 @@ with st.expander("Ver y editar círculos", expanded=False):
     )
 
 st.subheader("Actividades y análisis")
+st.caption("Esta versión no usa mínimos obligatorios. Las cantidades resultan de AHP, presupuesto, geometría, capacidad operativa y conservación de muestras.")
 left, right = st.columns(2)
 with left:
     st.markdown("**Campo**")
@@ -946,7 +937,6 @@ with left:
         column_config={
             "tiempo_h_por_punto": st.column_config.NumberColumn("Tiempo h/punto", min_value=0),
             "peso_ahp": st.column_config.NumberColumn("Peso AHP", min_value=0.0, format="%.4f"),
-            "minimo": st.column_config.NumberColumn("Mínimo", min_value=0),
             "produce_muestra_lab": st.column_config.CheckboxColumn("Produce muestra lab"),
         },
     )
@@ -959,7 +949,6 @@ with right:
         column_config={
             "costo_por_muestra": st.column_config.NumberColumn("Costo/muestra COP", min_value=0, step=100_000),
             "peso_ahp": st.column_config.NumberColumn("Peso AHP", min_value=0.0, format="%.4f"),
-            "minimo": st.column_config.NumberColumn("Mínimo", min_value=0),
         },
     )
 
@@ -998,7 +987,6 @@ if run:
                 max_teams=int(max_teams),
                 logistic_daily_cost=int(logistic_daily),
                 n_mode=n_mode_label,
-                enforce_minimums=enforce_minimums,
                 lab_cap_enabled=lab_cap_enabled,
                 allow_multiple_activities=allow_multiple,
                 time_limit_per_stage=int(time_limit),
