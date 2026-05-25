@@ -30,6 +30,79 @@ class ParsedData:
     lab_df: pd.DataFrame
 
 
+
+GENERAL_PARAM_ROWS = [
+    {"Parametro": "Tiempo total disponible para el muestreo", "Unidad": "Días", "Valor": 60},
+    {"Parametro": "Horas efectivas de trabajo del equipo por día", "Unidad": "Horas", "Valor": 8},
+    {"Parametro": "Presupuesto Total Disponible", "Unidad": "COP", "Valor": 446852500},
+    {"Parametro": "Logística de Muestreo (Honorarios, Viáticos y Transporte)", "Unidad": "COP/día", "Valor": 1513000},
+    {"Parametro": "Cantidad de equipos/sensores disponibles", "Unidad": "Unidad", "Valor": 2},
+]
+
+DEFAULT_FIELD_ROWS = [
+    {"actividad": "Muestreo puntual estándar", "tiempo_h_por_punto": 1, "peso_ahp": 0.2417, "minimo": 69, "produce_muestra_lab": True},
+    {"actividad": "Muestreo multinivel", "tiempo_h_por_punto": 3, "peso_ahp": 0.2029, "minimo": 90, "produce_muestra_lab": True},
+    {"actividad": "Medición 24 horas", "tiempo_h_por_punto": 25, "peso_ahp": 0.1459, "minimo": 10, "produce_muestra_lab": False},
+    {"actividad": "Medición extendida", "tiempo_h_por_punto": 121, "peso_ahp": 0.0523, "minimo": 2, "produce_muestra_lab": False},
+]
+
+DEFAULT_LAB_ROWS = [
+    {"analisis": "Cromatografía de Gas", "costo_por_muestra": 1190000, "peso_ahp": 0.1511, "minimo": 15},
+    {"analisis": "Isotopía de Deuterio", "costo_por_muestra": 6538812, "peso_ahp": 0.0897, "minimo": 5},
+    {"analisis": "Isotopía de Helio", "costo_por_muestra": 6538812, "peso_ahp": 0.0438, "minimo": 5},
+    {"analisis": "Caracterización mineralógica", "costo_por_muestra": 1953385, "peso_ahp": 0.0399, "minimo": 15},
+    {"analisis": "Biogeoquímica", "costo_por_muestra": 3015249, "peso_ahp": 0.0328, "minimo": 15},
+]
+
+
+def default_manual_data() -> ParsedData:
+    """Datos iniciales para usar la app sin Excel. El usuario puede editar todo a mano."""
+    params_df = pd.DataFrame(GENERAL_PARAM_ROWS)
+    params = dict(zip(params_df["Parametro"], params_df["Valor"]))
+    circles = pd.DataFrame([
+        {"ID": "C1", "Perimetro_m": 100.0},
+        {"ID": "C2", "Perimetro_m": 150.0},
+        {"ID": "C3", "Perimetro_m": 250.0},
+    ])
+    return ParsedData(
+        params=params,
+        circles=circles,
+        field_df=pd.DataFrame(DEFAULT_FIELD_ROWS),
+        lab_df=pd.DataFrame(DEFAULT_LAB_ROWS),
+    )
+
+
+def build_template_excel_bytes() -> bytes:
+    """Plantilla descargable con el formato recomendado para la app."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        pd.DataFrame(GENERAL_PARAM_ROWS).to_excel(writer, sheet_name="Parametros", index=False)
+        pd.DataFrame([
+            {"ID": "C1", "Perimetro_m": 113.0},
+            {"ID": "C2", "Perimetro_m": 164.0},
+            {"ID": "C3", "Perimetro_m": 702.0},
+        ]).to_excel(writer, sheet_name="Circulos", index=False)
+        pd.DataFrame(DEFAULT_FIELD_ROWS).to_excel(writer, sheet_name="Campo", index=False)
+        pd.DataFrame(DEFAULT_LAB_ROWS).to_excel(writer, sheet_name="Laboratorio", index=False)
+        notes = pd.DataFrame([
+            {"Hoja": "Parametros", "Descripcion": "Parámetros generales del modelo. Debe conservar columnas: Parametro, Unidad, Valor."},
+            {"Hoja": "Circulos", "Descripcion": "Lista de círculos de hadas. Debe conservar columnas: ID, Perimetro_m."},
+            {"Hoja": "Campo", "Descripcion": "Actividades de campo. produce_muestra_lab=True si cada punto genera una muestra física para laboratorio."},
+            {"Hoja": "Laboratorio", "Descripcion": "Tipos de análisis de laboratorio, costo por muestra, peso AHP y mínimo opcional."},
+            {"Hoja": "Importante", "Descripcion": "La restricción actual usa conservación total: suma de muestras de laboratorio <= muestras físicas recolectadas en campo."},
+        ])
+        notes.to_excel(writer, sheet_name="Notas_formato", index=False)
+        for ws in writer.book.worksheets:
+            ws.freeze_panes = "A2"
+            for column_cells in ws.columns:
+                max_len = 10
+                for cell in column_cells[:100]:
+                    if cell.value is not None:
+                        max_len = max(max_len, len(str(cell.value)))
+                ws.column_dimensions[column_cells[0].column_letter].width = min(max_len + 2, 55)
+    return output.getvalue()
+
+
 def _safe_float(value, default=0.0):
     try:
         if pd.isna(value):
@@ -99,17 +172,56 @@ def clean_model_inputs(
     return circles, field_df, lab_df
 
 
-def parse_excel(file_obj) -> ParsedData:
-    """Lee Data.xlsx y lo transforma en tablas útiles para el modelo."""
-    master = pd.read_excel(file_obj, sheet_name="Master_Datos")
-    circles = pd.read_excel(file_obj, sheet_name="Sheet2")
+
+def _read_params_table(df: pd.DataFrame) -> Dict[str, float]:
+    df = df.iloc[:, :3].copy()
+    df.columns = ["Parametro", "Unidad", "Valor"]
+    df = df.dropna(subset=["Parametro"])
+    df["Parametro"] = df["Parametro"].astype(str).str.strip()
+    return dict(zip(df["Parametro"], df["Valor"]))
+
+
+def _parse_new_template(xls: pd.ExcelFile) -> ParsedData:
+    sheet_map = {s.lower().strip(): s for s in xls.sheet_names}
+    params_df = xls.parse(sheet_map["parametros"])
+    params = _read_params_table(params_df)
+
+    circles = xls.parse(sheet_map["circulos"])
+    if len(circles.columns) < 2:
+        raise ValueError("La hoja Circulos debe tener al menos dos columnas: ID y Perimetro_m.")
+    circles = circles.iloc[:, :2].copy()
+    circles.columns = ["ID", "Perimetro_m"]
+    circles["ID"] = _clean_name_series(circles["ID"])
+    circles["Perimetro_m"] = pd.to_numeric(circles["Perimetro_m"], errors="coerce")
+    circles = circles[(circles["ID"] != "") & circles["Perimetro_m"].notna()].reset_index(drop=True)
+
+    field_df = xls.parse(sheet_map["campo"])
+    lab_df = xls.parse(sheet_map["laboratorio"])
+
+    # Normalizar columnas esperadas del formato nuevo.
+    field_expected = ["actividad", "tiempo_h_por_punto", "peso_ahp", "minimo", "produce_muestra_lab"]
+    lab_expected = ["analisis", "costo_por_muestra", "peso_ahp", "minimo"]
+    if len(field_df.columns) >= len(field_expected):
+        field_df = field_df.iloc[:, :len(field_expected)].copy()
+        field_df.columns = field_expected
+    else:
+        raise ValueError(f"La hoja Campo debe tener columnas: {', '.join(field_expected)}")
+    if len(lab_df.columns) >= len(lab_expected):
+        lab_df = lab_df.iloc[:, :len(lab_expected)].copy()
+        lab_df.columns = lab_expected
+    else:
+        raise ValueError(f"La hoja Laboratorio debe tener columnas: {', '.join(lab_expected)}")
+
+    return ParsedData(params=params, circles=circles, field_df=field_df, lab_df=lab_df)
+
+
+def _parse_legacy_excel(xls: pd.ExcelFile) -> ParsedData:
+    """Lee el Data.xlsx original con hojas Master_Datos y Sheet2."""
+    master = xls.parse("Master_Datos")
+    circles = xls.parse("Sheet2")
 
     # Normalización mínima de columnas
-    master = master.iloc[:, :3].copy()
-    master.columns = ["Parametro", "Unidad", "Valor"]
-    master = master.dropna(subset=["Parametro"])
-    master["Parametro"] = master["Parametro"].astype(str).str.strip()
-    params = dict(zip(master["Parametro"], master["Valor"]))
+    params = _read_params_table(master)
 
     circles = circles.iloc[:, :2].copy()
     circles.columns = ["ID", "Perimetro_m"]
@@ -118,7 +230,7 @@ def parse_excel(file_obj) -> ParsedData:
     circles["Perimetro_m"] = pd.to_numeric(circles["Perimetro_m"], errors="coerce")
     circles = circles.dropna(subset=["Perimetro_m"]).reset_index(drop=True)
 
-    # Actividades de campo según el Excel actual
+    # Actividades de campo según el Excel original
     field_df = pd.DataFrame(
         [
             {
@@ -191,6 +303,19 @@ def parse_excel(file_obj) -> ParsedData:
     return ParsedData(params=params, circles=circles, field_df=field_df, lab_df=lab_df)
 
 
+def parse_excel(file_obj) -> ParsedData:
+    """Lee un Excel en dos formatos: plantilla nueva o Data.xlsx original."""
+    xls = pd.ExcelFile(file_obj)
+    sheets = {s.lower().strip() for s in xls.sheet_names}
+    if {"parametros", "circulos", "campo", "laboratorio"}.issubset(sheets):
+        return _parse_new_template(xls)
+    if {"master_datos", "sheet2"}.issubset(sheets):
+        return _parse_legacy_excel(xls)
+    raise ValueError(
+        "Formato no reconocido. Usa la plantilla con hojas Parametros, Circulos, Campo y Laboratorio, "
+        "o el Data.xlsx original con Master_Datos y Sheet2."
+    )
+
 def parse_separations(text: str) -> List[int]:
     vals = []
     for raw in text.replace(";", ",").split(","):
@@ -262,11 +387,44 @@ def _integer_proportional_allocation(total: int, capacities: pd.Series) -> pd.Se
     return base.astype(int)
 
 
+
+def _integer_proportional_allocation_capped(total: int, capacities: pd.Series) -> pd.Series:
+    """Distribuye enteros proporcionalmente sin superar la capacidad de cada fila."""
+    total = int(total)
+    capacities = pd.to_numeric(capacities, errors="coerce").fillna(0).astype(int)
+    result = pd.Series([0] * len(capacities), index=capacities.index, dtype=int)
+    if total <= 0 or capacities.sum() <= 0:
+        return result
+    if total > int(capacities.sum()):
+        total = int(capacities.sum())
+
+    raw = capacities.astype(float) / float(capacities.sum()) * total
+    base = raw.apply(math.floor).astype(int)
+    base = pd.concat([base, capacities], axis=1).min(axis=1).astype(int)
+    result = base.copy()
+    remainder = total - int(result.sum())
+
+    fractional = (raw - base).sort_values(ascending=False)
+    while remainder > 0:
+        progressed = False
+        for idx in fractional.index:
+            if result.loc[idx] < capacities.loc[idx]:
+                result.loc[idx] += 1
+                remainder -= 1
+                progressed = True
+                if remainder == 0:
+                    break
+        if not progressed:
+            break
+    return result.astype(int)
+
+
 def build_lab_allocation_by_circle(plan_df: pd.DataFrame, lab_result_df: pd.DataFrame, lab_input_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Genera una asignación sugerida de análisis de laboratorio por círculo.
 
-    Nota metodológica: el MILP decide las cantidades globales L_k. Esta tabla reparte esas
-    cantidades entre círculos de forma proporcional a las muestras físicas producidas en campo.
+    El MILP decide cantidades globales L_k. Esta función reparte esas cantidades entre
+    círculos respetando la conservación total: los análisis asignados a un círculo no
+    superan sus muestras físicas disponibles, salvo redondeos imposibles por datos vacíos.
     """
     if plan_df.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -287,14 +445,26 @@ def build_lab_allocation_by_circle(plan_df: pd.DataFrame, lab_result_df: pd.Data
 
     lab_costs = lab_input_df[["analisis", "costo_por_muestra"]].copy()
     lab_counts = lab_result_df[["analisis", "muestras_L"]].merge(lab_costs, on="analisis", how="left")
+    lab_counts["muestras_L"] = pd.to_numeric(lab_counts["muestras_L"], errors="coerce").fillna(0).astype(int)
+
+    total_lab_samples = int(lab_counts["muestras_L"].sum())
+    circle_quota = _integer_proportional_allocation_capped(total_lab_samples, wide["muestras_campo_disponibles"])
+    wide["lab_total_asignado"] = circle_quota.values
+    remaining_by_circle = circle_quota.copy()
 
     long_rows = []
-    for _, lab_row in lab_counts.iterrows():
+    # Asignar todos los análisis menos el último de forma proporcional a la cuota restante;
+    # el último absorbe el saldo para mantener sumas exactas por análisis y por círculo.
+    for pos, (_, lab_row) in enumerate(lab_counts.iterrows()):
         analysis = lab_row["analisis"]
-        total_samples = int(round(_safe_float(lab_row.get("muestras_L"), 0)))
+        total_samples = int(lab_row["muestras_L"])
         cost_per_sample = _safe_float(lab_row.get("costo_por_muestra"), 0)
-        allocation = _integer_proportional_allocation(total_samples, wide["muestras_campo_disponibles"])
+        if pos == len(lab_counts) - 1:
+            allocation = remaining_by_circle.copy()
+        else:
+            allocation = _integer_proportional_allocation_capped(total_samples, remaining_by_circle)
         wide[analysis] = allocation.values
+        remaining_by_circle = (remaining_by_circle - allocation).clip(lower=0).astype(int)
         for idx, alloc in allocation.items():
             long_rows.append(
                 {
@@ -307,11 +477,11 @@ def build_lab_allocation_by_circle(plan_df: pd.DataFrame, lab_result_df: pd.Data
                 }
             )
 
+    wide["muestras_campo_sin_usar_lab"] = wide["muestras_campo_disponibles"] - wide["lab_total_asignado"]
     long_df = pd.DataFrame(long_rows)
     if not long_df.empty:
         long_df = long_df.sort_values(["circulo", "analisis"]).reset_index(drop=True)
     return wide, long_df
-
 
 def build_excel_report(result: Dict, field_input_df: pd.DataFrame, lab_input_df: pd.DataFrame) -> bytes:
     """Construye un Excel multi-hoja con resumen, plan por actividad y laboratorio por círculo."""
@@ -508,11 +678,11 @@ def solve_milp_ahp(
             if row["minimo"] > 0:
                 model.Add(L[row["analisis"]] >= int(round(row["minimo"])))
 
-    # Capacidad de laboratorio opcional: cada análisis no puede superar muestras físicas producidas
+    # Conservación de muestras opcional:
+    # el total de análisis de laboratorio no puede superar las muestras físicas producidas en campo.
     if lab_cap_enabled:
         sample_capacity = sum(Q[f] for f in F if produce_lab_sample.get(f, False))
-        for k in K:
-            model.Add(L[k] <= sample_capacity)
+        model.Add(sum(L[k] for k in K) <= sample_capacity)
 
     # Desviaciones AHP como valores absolutos enteros escalados
     max_dev = budget * W_SCALE
@@ -610,6 +780,8 @@ def solve_milp_ahp(
                 "Gasto laboratorio": clab_val,
                 "Equipos": int(solver.Value(E)),
                 "Tiempo campo h": total_time,
+                "Muestras físicas para laboratorio": int(sum(q for f, q in [(row["actividad"], int(solver.Value(Q[row["actividad"]]))) for _, row in field_df.iterrows()] if produce_lab_sample.get(f, False))),
+                "Muestras laboratorio totales": int(sum(int(solver.Value(L[k])) for k in K)),
                 "Z1 aprox COP": solver.Value(Z1) / W_SCALE,
                 "Z2 aprox COP": solver.Value(Z2) / W_SCALE,
                 "Uso presupuesto %": cused_val / max(1, budget),
@@ -671,7 +843,23 @@ st.caption("Asignación de recursos entre campo y laboratorio usando prioridades
 
 with st.sidebar:
     st.header("1) Datos")
-    uploaded = st.file_uploader("Carga tu Data.xlsx", type=["xlsx"])
+    st.download_button(
+        "📥 Descargar plantilla Excel",
+        data=build_template_excel_bytes(),
+        file_name="Data_template_MILP_AHP.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        help="Plantilla con hojas Parametros, Circulos, Campo y Laboratorio.",
+    )
+    data_mode = st.radio(
+        "Origen de datos",
+        options=["Subir Excel", "Ingresar manualmente"],
+        index=0,
+        help="Puedes cargar un Excel con el formato de la plantilla o ingresar/editar los datos directamente en la app.",
+    )
+    uploaded = None
+    if data_mode == "Subir Excel":
+        uploaded = st.file_uploader("Carga tu Data.xlsx", type=["xlsx"])
 
     st.header("2) Solver")
     separations_text = st.text_input("Separaciones permitidas en metros", value="10, 20, 50")
@@ -684,16 +872,17 @@ with st.sidebar:
     allow_multiple = st.checkbox(
         "Permitir varias actividades por círculo (formulación Word)",
         value=True,
-        help="Más fiel al modelo original, pero puede tardar más. Si el solver no encuentra solución rápido, desactívalo.",
+        help="Más fiel al modelo: cada círculo incluido debe tener al menos una actividad, pero no necesariamente muestreo puntual.",
     )
     enforce_minimums = st.checkbox(
-        "Activar mínimos del Excel",
+        "Activar mínimos del Excel/manual",
         value=False,
-        help="El documento lógico indica que no se imponen mínimos por actividad; por eso queda desactivado por defecto.",
+        help="El modelo base no fuerza mínimos por actividad; puedes activarlos si quieres que se respeten los mínimos cargados.",
     )
     lab_cap_enabled = st.checkbox(
-        "Limitar muestras de laboratorio por muestras de campo producidas",
+        "Conservación total de muestras: laboratorio ≤ campo",
         value=True,
+        help="Impone suma de todos los análisis de laboratorio ≤ muestras físicas recolectadas en actividades marcadas como Produce muestra lab.",
     )
     time_limit = st.slider("Tiempo máximo por etapa (s)", min_value=3, max_value=120, value=15, step=1)
     relative_tolerance = st.select_slider(
@@ -703,21 +892,24 @@ with st.sidebar:
         format_func=lambda x: f"{x:g}",
     )
 
-# Carga inicial: el usuario debe cargar su propio Excel.
-if uploaded is None:
-    st.info("Carga tu archivo Data.xlsx para comenzar.")
-    st.stop()
-
-try:
-    parsed = parse_excel(uploaded)
-except Exception as exc:
-    st.error(f"No pude leer el Excel: {exc}")
-    st.stop()
+# Carga inicial: Excel o entrada manual.
+if data_mode == "Subir Excel":
+    if uploaded is None:
+        st.info("Carga tu archivo Data.xlsx o descarga la plantilla para llenarla.")
+        st.stop()
+    try:
+        parsed = parse_excel(uploaded)
+    except Exception as exc:
+        st.error(f"No pude leer el Excel: {exc}")
+        st.stop()
+else:
+    parsed = default_manual_data()
+    st.info("Modo manual activo: edita las tablas directamente en la app. También puedes descargar la plantilla si prefieres preparar los datos en Excel.")
 
 params = parsed.params
 
 st.subheader("Parámetros generales")
-c1, c2, c3, c4, c5 = st.columns(5)
+c1, c2, c3, c4, c5, c6 = st.columns(6)
 with c1:
     budget = st.number_input("Presupuesto total COP", value=int(_safe_float(params.get("Presupuesto Total Disponible"), 0)), min_value=1, step=1_000_000)
 with c2:
@@ -728,6 +920,11 @@ with c4:
     max_teams = st.number_input("Equipos/sensores máx.", value=int(_safe_float(params.get("Cantidad de equipos/sensores disponibles"), 2)), min_value=1, step=1)
 with c5:
     logistic_daily = st.number_input("Costo logístico diario COP", value=int(_safe_float(params.get("Logística de Muestreo (Honorarios, Viáticos y Transporte)"), 0)), min_value=0, step=100_000)
+with c6:
+    reserve_pct = st.number_input("Reserva/imprevistos %", value=0.0, min_value=0.0, max_value=50.0, step=1.0, help="Porcentaje del presupuesto que se deja sin optimizar para imprevistos.")
+
+effective_budget = int(round(float(budget) * (1 - float(reserve_pct) / 100)))
+st.caption(f"Presupuesto optimizable por el solver: ${effective_budget:,.0f} COP. Reserva: ${int(budget) - effective_budget:,.0f} COP.")
 
 st.subheader("Círculos de hadas / perímetros")
 with st.expander("Ver y editar círculos", expanded=False):
@@ -795,7 +992,7 @@ if run:
                 field_df=clean_field_df,
                 lab_df=clean_lab_df,
                 separations=separations,
-                budget_cop=int(budget),
+                budget_cop=int(effective_budget),
                 days_available=int(days),
                 hours_per_day=int(hours),
                 max_teams=int(max_teams),
@@ -885,7 +1082,8 @@ if run:
         st.markdown("**Asignación sugerida de laboratorio por círculo**")
         st.caption(
             "El modelo optimiza las cantidades globales de laboratorio. "
-            "Esta tabla reparte esas cantidades entre círculos proporcionalmente a las muestras físicas disponibles."
+            "Esta tabla reparte esas cantidades entre círculos proporcionalmente a las muestras físicas disponibles, "
+            "respetando que el total de análisis no supere las muestras físicas recolectadas."
         )
         st.dataframe(lab_by_circle, use_container_width=True)
         if not result["lab"].empty:
@@ -905,10 +1103,10 @@ else:
     st.markdown(
         """
         ### Flujo sugerido
-        1. Revisa o edita los parámetros generales.
-        2. Ajusta actividades de campo, análisis de laboratorio y pesos AHP.
+        1. Sube un Excel con el formato de la plantilla o selecciona **Ingresar manualmente**.
+        2. Revisa o edita parámetros generales, círculos, campo, laboratorio y pesos AHP.
         3. Define las separaciones permitidas.
-        4. Ejecuta la optimización.
+        4. Ejecuta la optimización y descarga el reporte Excel multi-hoja.
 
         **Nota:** si el solver tarda o devuelve solo `FEASIBLE`, prueba con menos separaciones o desactiva
         “Permitir varias actividades por círculo” para usar una versión más rápida del problema.
