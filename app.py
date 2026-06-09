@@ -10,7 +10,7 @@ from ortools.sat.python import cp_model
 
 
 st.set_page_config(
-    page_title="MILP-AHP | Costo equipo 2 personas + factor 1.1",
+    page_title="MILP-AHP | AHP local protegido",
     page_icon="🧪",
     layout="wide",
 )
@@ -53,7 +53,7 @@ W_SCALE = 10_000
 # muy pequeña de conservación de coherencia para poder exprimir el presupuesto.
 LEXI_TOL_PCT = 0.0025  # 0.25 % del presupuesto, expresado en unidades escaladas
 TARGET_BUDGET_USE = 0.995  # se considera saturado si usa al menos 99.5 %
-DEFAULT_MIN_BUDGET_USE = 0.95  # v11: evita que etapas AHP se calibren con soluciones demasiado pequeñas
+DEFAULT_MIN_BUDGET_USE = 0.0  # v13: por defecto NO se fuerza un piso de presupuesto porque puede distorsionar el AHP local
 
 
 @dataclass
@@ -323,7 +323,8 @@ def clean_model_inputs(
             "c_var_Dia_COP_h": "c_var_Dia_COP_h_persona",
             "c_var_Noche_COP_h": "c_var_Noche_COP_h_persona",
         })
-    field_df["_c_var_ya_es_equipo"] = False
+    if "_c_var_ya_es_equipo" not in field_df.columns:
+        field_df["_c_var_ya_es_equipo"] = False
     if "c_h_Dia_COP_h" in field_df.columns and "c_var_Dia_COP_h_persona" not in field_df.columns:
         field_df = field_df.rename(columns={
             "c_h_Dia_COP_h": "c_var_Dia_COP_h_persona",
@@ -500,7 +501,7 @@ def model_equations_table() -> pd.DataFrame:
         ("Costo lab", "C_k = factor_costo_total * c_lab,k * L_k"),
         ("Agregados", "C_field=sum_f C_f; C_lab=sum_k C_k; C_used=C_field+C_lab"),
         ("Presupuesto", "C_used <= C_total"),
-        ("Uso mínimo opcional", "C_used >= u_min*C_total, usado solo si se activa en la interfaz"),
+        ("Uso mínimo opcional", "C_used >= u_min*C_total. En v13 está desactivado por defecto porque puede distorsionar el AHP local"),
         ("Capacidad", "sum_f t_f,w * Q_f <= E_w * T_max * H_turno  para todo w"),
         ("Equipos", "E_w <= E_max  para todo w"),
         ("Conservación", "sum_k L_k <= sum_f Q_f"),
@@ -909,14 +910,14 @@ def solve_milp_ahp_word(
 # -----------------------------
 
 st.title("🧪 Optimización MILP-AHP para estrategias de muestreo")
-st.caption("Versión basada en la formulación Word: turnos Día/Noche, sin mínimos, con costo horario efectivo por equipo = costo variable horario + costo fijo diario prorrateado.")
+st.caption("Versión basada en la formulación Word: turnos Día/Noche, sin mínimos, costo horario efectivo por equipo y AHP local protegido. El piso de presupuesto queda desactivado por defecto.")
 
 with st.sidebar:
     st.header("1) Datos")
     st.download_button(
         "📥 Descargar plantilla Excel estricta",
         data=build_template_excel_bytes(),
-        file_name="Data_template_MILP_AHP_costo_equipo.xlsx",
+        file_name="Data_template_MILP_AHP_v13_AHP_local_protegido.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
         on_click="ignore",
@@ -929,13 +930,18 @@ with st.sidebar:
     st.header("2) Solver")
     time_limit = st.slider("Tiempo máximo por etapa (s)", min_value=3, max_value=180, value=30, step=1)
     min_budget_pct = st.slider(
-        "Uso mínimo de presupuesto para calibrar AHP (%)",
-        min_value=0, max_value=100, value=int(DEFAULT_MIN_BUDGET_USE * 100), step=1,
+        "Piso mínimo de presupuesto durante calibración AHP (%) — opcional",
+        min_value=0, max_value=100, value=0, step=1,
         help=(
-            "Evita que las etapas 1 y 2 minimicen desviaciones absolutas con una solución demasiado pequeña. "
-            "Si el modelo es infactible, baja este valor."
+            "Déjalo en 0 para seguir la secuencia lexicográfica del Word sin forzar gasto antes de ajustar AHP. "
+            "Si lo subes demasiado, el modelo puede usar actividades caras para alcanzar presupuesto y desajustar el AHP local."
         ),
     )
+    if min_budget_pct >= 80:
+        st.warning(
+            "Piso de presupuesto alto: puede forzar soluciones que gastan más, "
+            "pero desajustan la distribución local de campo/laboratorio. Úsalo solo para sensibilidad."
+        )
 
 if data_mode == "Subir Excel":
     if uploaded is None:
@@ -1174,6 +1180,16 @@ if bundle is not None:
     with tab2:
         st.dataframe(result["field"], use_container_width=True)
         if not result["field"].empty:
+            tmp_dev = result["field"].copy()
+            tmp_dev["desviacion_pp"] = (tmp_dev["participacion_real_campo"] - tmp_dev["alpha_f"]).abs()
+            max_dev = float(tmp_dev["desviacion_pp"].max())
+            if max_dev > 0.20:
+                st.warning(
+                    "La distribución local de campo está muy alejada del AHP. "
+                    "Esto suele ocurrir cuando se fuerza un piso alto de presupuesto o cuando, por costos/tiempos/geometría, "
+                    "la única forma factible de gastar más es usar una actividad cara como medición 24 h. "
+                    "Prueba bajar el piso mínimo de presupuesto o revisar costos/tiempos."
+                )
             field_plot = result["field"].melt(
                 id_vars="actividad",
                 value_vars=["alpha_f", "participacion_real_campo"],
