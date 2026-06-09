@@ -10,7 +10,7 @@ from ortools.sat.python import cp_model
 
 
 st.set_page_config(
-    page_title="MILP-AHP | Modelo Word",
+    page_title="MILP-AHP | Costo efectivo equipo",
     page_icon="🧪",
     layout="wide",
 )
@@ -34,6 +34,12 @@ if "last_solution_bundle" not in st.session_state:
 # - no usa selector floor/ceil/round: aplica n_i,s = max(1, floor(P_i/s))
 # - no permite cambiar la lógica de activación del círculo
 # - conservación de muestras: sum_k L_k <= sum_f Q_f
+#
+# Ajuste v10:
+# El parámetro c_h,f,w del Word se interpreta como costo horario EFECTIVO
+# del equipo. La app permite descomponerlo en:
+#   costo variable horario + costo fijo diario del equipo / horas de prorrateo
+# y entrega al solver el c_h,f,w efectivo.
 # =========================================================
 
 SHIFTS = ["Dia", "Noche"]
@@ -78,10 +84,46 @@ DEFAULT_SEPARATIONS = [
 ]
 
 DEFAULT_FIELD_ROWS = [
-    {"actividad": "Muestreo puntual estándar", "alpha_f": 0.3758, "t_Dia_h": 1, "t_Noche_h": 0, "c_h_Dia_COP_h": 189125, "c_h_Noche_COP_h": 250000},
-    {"actividad": "Muestreo multinivel", "alpha_f": 0.3154, "t_Dia_h": 3, "t_Noche_h": 0, "c_h_Dia_COP_h": 189125, "c_h_Noche_COP_h": 250000},
-    {"actividad": "Medición 24 horas", "alpha_f": 0.2268, "t_Dia_h": 12, "t_Noche_h": 13, "c_h_Dia_COP_h": 189125, "c_h_Noche_COP_h": 250000},
-    {"actividad": "Medición extendida", "alpha_f": 0.0820, "t_Dia_h": 60, "t_Noche_h": 61, "c_h_Dia_COP_h": 189125, "c_h_Noche_COP_h": 250000},
+    {
+        "actividad": "Muestreo puntual estándar",
+        "alpha_f": 0.3758,
+        "t_Dia_h": 1,
+        "t_Noche_h": 0,
+        "c_var_Dia_COP_h": 13333.33,
+        "c_var_Noche_COP_h": 0.0,
+        "costo_fijo_diario_equipo_COP": 766600.0,
+        "horas_prorrateo_fijo": 9,
+    },
+    {
+        "actividad": "Muestreo multinivel",
+        "alpha_f": 0.3154,
+        "t_Dia_h": 3,
+        "t_Noche_h": 0,
+        "c_var_Dia_COP_h": 13333.33,
+        "c_var_Noche_COP_h": 0.0,
+        "costo_fijo_diario_equipo_COP": 766600.0,
+        "horas_prorrateo_fijo": 9,
+    },
+    {
+        "actividad": "Medición 24 horas",
+        "alpha_f": 0.2268,
+        "t_Dia_h": 15,
+        "t_Noche_h": 9,
+        "c_var_Dia_COP_h": 20750.0,
+        "c_var_Noche_COP_h": 27125.0,
+        "costo_fijo_diario_equipo_COP": 766600.0,
+        "horas_prorrateo_fijo": 24,
+    },
+    {
+        "actividad": "Medición extendida",
+        "alpha_f": 0.0820,
+        "t_Dia_h": 60,
+        "t_Noche_h": 61,
+        "c_var_Dia_COP_h": 20750.0,
+        "c_var_Noche_COP_h": 27125.0,
+        "costo_fijo_diario_equipo_COP": 766600.0,
+        "horas_prorrateo_fijo": 121,
+    },
 ]
 
 DEFAULT_LAB_ROWS = [
@@ -121,7 +163,7 @@ def build_template_excel_bytes() -> bytes:
             {"Hoja": "Parametros", "Descripcion": "Debe conservar: Parametro, Descripcion, Unidad, Valor. Incluye T_max, H_turno, C_total, E_max, beta_F, beta_L."},
             {"Hoja": "Circulos", "Descripcion": "Conjunto I. Columnas: ID, Perimetro_m."},
             {"Hoja": "Separaciones", "Descripcion": "Conjunto S. Columna: separacion_m."},
-            {"Hoja": "Campo", "Descripcion": "Conjunto F. Columnas: actividad, alpha_f, t_Dia_h, t_Noche_h, c_h_Dia_COP_h, c_h_Noche_COP_h. No hay mínimos ni produce_muestra_lab."},
+            {"Hoja": "Campo", "Descripcion": "Conjunto F. Columnas: actividad, alpha_f, t_Dia_h, t_Noche_h, c_var_Dia_COP_h, c_var_Noche_COP_h, costo_fijo_diario_equipo_COP, horas_prorrateo_fijo. La app calcula c_h efectivo = c_var + fijo_diario/horas_prorrateo."},
             {"Hoja": "Laboratorio", "Descripcion": "Conjunto K. Columnas: analisis, gamma_k, c_lab_COP_muestra."},
             {"Hoja": "Modelo", "Descripcion": "Conservación: sum_k L_k <= sum_f Q_f. Todas las actividades de campo aportan a sum_f Q_f."},
         ])
@@ -190,10 +232,30 @@ def parse_excel(file_obj) -> ParsedData:
     separations.columns = ["separacion_m"]
 
     field_df = xls.parse(sheet_map["campo"])
-    if len(field_df.columns) < 6:
-        raise ValueError("La hoja Campo debe tener columnas: actividad, alpha_f, t_Dia_h, t_Noche_h, c_h_Dia_COP_h, c_h_Noche_COP_h.")
-    field_df = field_df.iloc[:, :6].copy()
-    field_df.columns = ["actividad", "alpha_f", "t_Dia_h", "t_Noche_h", "c_h_Dia_COP_h", "c_h_Noche_COP_h"]
+    if len(field_df.columns) >= 8:
+        field_df = field_df.iloc[:, :8].copy()
+        field_df.columns = [
+            "actividad",
+            "alpha_f",
+            "t_Dia_h",
+            "t_Noche_h",
+            "c_var_Dia_COP_h",
+            "c_var_Noche_COP_h",
+            "costo_fijo_diario_equipo_COP",
+            "horas_prorrateo_fijo",
+        ]
+    elif len(field_df.columns) >= 6:
+        # Compatibilidad con plantillas viejas: trata c_h como costo efectivo
+        # ya calculado y usa costo fijo 0.
+        field_df = field_df.iloc[:, :6].copy()
+        field_df.columns = ["actividad", "alpha_f", "t_Dia_h", "t_Noche_h", "c_var_Dia_COP_h", "c_var_Noche_COP_h"]
+        field_df["costo_fijo_diario_equipo_COP"] = 0.0
+        field_df["horas_prorrateo_fijo"] = 1.0
+    else:
+        raise ValueError(
+            "La hoja Campo debe tener columnas: actividad, alpha_f, t_Dia_h, t_Noche_h, "
+            "c_var_Dia_COP_h, c_var_Noche_COP_h, costo_fijo_diario_equipo_COP, horas_prorrateo_fijo."
+        )
 
     lab_df = xls.parse(sheet_map["laboratorio"])
     if len(lab_df.columns) < 3:
@@ -227,15 +289,49 @@ def clean_model_inputs(
     sep = pd.to_numeric(separations["separacion_m"], errors="coerce").dropna()
     sep = sorted(set(int(round(x)) for x in sep if x > 0))
 
-    required_field = ["actividad", "alpha_f", "t_Dia_h", "t_Noche_h", "c_h_Dia_COP_h", "c_h_Noche_COP_h"]
+    # Formato v10: se ingresa costo variable horario + costo fijo diario por equipo.
+    # La app calcula el costo horario efectivo c_h,f,w que entra en el MILP.
+    # Compatibilidad: si llega una plantilla vieja con c_h_Dia/COP_h, se interpreta
+    # como costo variable ya efectivo y fijo = 0.
+    if "c_h_Dia_COP_h" in field_df.columns and "c_var_Dia_COP_h" not in field_df.columns:
+        field_df = field_df.rename(columns={
+            "c_h_Dia_COP_h": "c_var_Dia_COP_h",
+            "c_h_Noche_COP_h": "c_var_Noche_COP_h",
+        })
+        field_df["costo_fijo_diario_equipo_COP"] = 0.0
+        field_df["horas_prorrateo_fijo"] = 1.0
+
+    required_field = [
+        "actividad",
+        "alpha_f",
+        "t_Dia_h",
+        "t_Noche_h",
+        "c_var_Dia_COP_h",
+        "c_var_Noche_COP_h",
+        "costo_fijo_diario_equipo_COP",
+        "horas_prorrateo_fijo",
+    ]
     for col in required_field:
         if col not in field_df.columns:
             raise ValueError(f"La tabla Campo debe contener la columna {col}.")
     field_df["actividad"] = _clean_name_series(field_df["actividad"])
     field_df = field_df[field_df["actividad"] != ""].copy()
-    for col in ["alpha_f", "t_Dia_h", "t_Noche_h", "c_h_Dia_COP_h", "c_h_Noche_COP_h"]:
+    for col in [
+        "alpha_f",
+        "t_Dia_h",
+        "t_Noche_h",
+        "c_var_Dia_COP_h",
+        "c_var_Noche_COP_h",
+        "costo_fijo_diario_equipo_COP",
+        "horas_prorrateo_fijo",
+    ]:
         field_df[col] = pd.to_numeric(field_df[col], errors="coerce").fillna(0)
-    field_df = field_df[(field_df["t_Dia_h"] + field_df["t_Noche_h"]) > 0].reset_index(drop=True)
+    field_df = field_df[(field_df["t_Dia_h"] + field_df["t_Noche_h"]) > 0].copy()
+    field_df = field_df[field_df["horas_prorrateo_fijo"] > 0].copy()
+    field_df["costo_fijo_COP_h"] = field_df["costo_fijo_diario_equipo_COP"] / field_df["horas_prorrateo_fijo"]
+    field_df["c_h_Dia_COP_h"] = field_df["c_var_Dia_COP_h"] + field_df["costo_fijo_COP_h"]
+    field_df["c_h_Noche_COP_h"] = field_df["c_var_Noche_COP_h"] + field_df["costo_fijo_COP_h"]
+    field_df = field_df.reset_index(drop=True)
 
     required_lab = ["analisis", "gamma_k", "c_lab_COP_muestra"]
     for col in required_lab:
@@ -355,6 +451,7 @@ def model_equations_table() -> pd.DataFrame:
         ("Activación", "sum_s y_i,f,s = z_i,f  para todo i,f"),
         ("Integralidad", "sum_f z_i,f >= 1  para todo i"),
         ("Cantidad campo", "Q_f = sum_i sum_s n_i,s * y_i,f,s"),
+        ("Costo horario efectivo", "c_h,f,w = c_var,h,f,w + F_diario_equipo,f / H_prorrateo,f"),
         ("Costo campo", "C_f = sum_w c_h,f,w * t_f,w * Q_f"),
         ("Costo lab", "C_k = c_lab,k * L_k"),
         ("Agregados", "C_field=sum_f C_f; C_lab=sum_k C_k; C_used=C_field+C_lab"),
@@ -394,6 +491,8 @@ def build_excel_report(result: Dict, field_input_df: pd.DataFrame, lab_input_df:
         for name, df in [
             ("Parametros_usados", params_df),
             ("Modelo_usado", equations),
+            ("Input_Campo_costos", field_input_df),
+            ("Input_Laboratorio", lab_input_df),
             ("Plan_completo", plan),
             ("Campo_resumen", field),
             ("Laboratorio_resumen", lab),
@@ -587,12 +686,22 @@ def solve_milp_ahp_word(
             day_h = int(t[(f, "Dia")] * q)
             night_h = int(t[(f, "Noche")] * q)
             cost = int(solver.Value(Cf[f]))
+            input_row = field_df[field_df["actividad"] == f].iloc[0]
+            cost_unit = sum(c_h[(f, w)] * t[(f, w)] for w in W)
             field_rows.append({
                 "actividad": f,
                 "cantidad_Q": q,
                 "tiempo_dia_h": day_h,
                 "tiempo_noche_h": night_h,
                 "tiempo_total_h": day_h + night_h,
+                "c_var_Dia_COP_h": float(input_row["c_var_Dia_COP_h"]),
+                "c_var_Noche_COP_h": float(input_row["c_var_Noche_COP_h"]),
+                "costo_fijo_diario_equipo_COP": float(input_row["costo_fijo_diario_equipo_COP"]),
+                "horas_prorrateo_fijo": float(input_row["horas_prorrateo_fijo"]),
+                "costo_fijo_COP_h": float(input_row["costo_fijo_COP_h"]),
+                "c_h_Dia_efectivo_COP_h": int(round(c_h[(f, "Dia")])),
+                "c_h_Noche_efectivo_COP_h": int(round(c_h[(f, "Noche")])),
+                "costo_unitario_campo_COP_punto": int(round(cost_unit)),
                 "costo_COP": cost,
                 "alpha_f": alpha[f] / W_SCALE,
                 "participacion_real_campo": cost / max(1, cfield_val),
@@ -730,14 +839,14 @@ def solve_milp_ahp_word(
 # -----------------------------
 
 st.title("🧪 Optimización MILP-AHP para estrategias de muestreo")
-st.caption("Versión basada en la formulación Word: turnos Día/Noche, sin mínimos, sin reserva, sin selector de producción de muestra y con etapa 3 orientada a maximizar presupuesto usado.")
+st.caption("Versión basada en la formulación Word: turnos Día/Noche, sin mínimos, con costo horario efectivo por equipo = costo variable horario + costo fijo diario prorrateado.")
 
 with st.sidebar:
     st.header("1) Datos")
     st.download_button(
         "📥 Descargar plantilla Excel estricta",
         data=build_template_excel_bytes(),
-        file_name="Data_template_MILP_AHP_word_strict.xlsx",
+        file_name="Data_template_MILP_AHP_costo_equipo.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
         on_click="ignore",
@@ -804,7 +913,7 @@ with st.expander("S: Separaciones permitidas", expanded=False):
 left, right = st.columns(2)
 with left:
     st.markdown("### F: Actividades de campo")
-    st.caption("No hay mínimos y no se pregunta si produce muestra: toda Q_f cuenta para la restricción Σ_k L_k ≤ Σ_f Q_f.")
+    st.caption("No hay mínimos y no se pregunta si produce muestra. La app calcula c_h efectivo = c_var + costo fijo diario del equipo / horas de prorrateo.")
     field_df = st.data_editor(
         parsed.field_df,
         num_rows="dynamic",
@@ -813,8 +922,10 @@ with left:
             "alpha_f": st.column_config.NumberColumn("α_f", min_value=0.0, max_value=1.0, format="%.4f"),
             "t_Dia_h": st.column_config.NumberColumn("t_f,Día (h)", min_value=0, step=1),
             "t_Noche_h": st.column_config.NumberColumn("t_f,Noche (h)", min_value=0, step=1),
-            "c_h_Dia_COP_h": st.column_config.NumberColumn("c_h,f,Día COP/h", min_value=0, step=10_000),
-            "c_h_Noche_COP_h": st.column_config.NumberColumn("c_h,f,Noche COP/h", min_value=0, step=10_000),
+            "c_var_Dia_COP_h": st.column_config.NumberColumn("Costo variable Día COP/h", min_value=0, step=1000),
+            "c_var_Noche_COP_h": st.column_config.NumberColumn("Costo variable Noche COP/h", min_value=0, step=1000),
+            "costo_fijo_diario_equipo_COP": st.column_config.NumberColumn("Costo fijo diario equipo COP/día", min_value=0, step=10_000),
+            "horas_prorrateo_fijo": st.column_config.NumberColumn("Horas prorrateo fijo", min_value=0.01, step=1),
         },
     )
 with right:
@@ -837,6 +948,19 @@ try:
         f"suma α_f = {preview_field['alpha_f'].sum():.4f}; "
         f"suma γ_k = {preview_lab['gamma_k'].sum():.4f}."
     )
+    with st.expander("Ver cálculo del costo horario efectivo de campo", expanded=False):
+        cost_preview_cols = [
+            "actividad",
+            "c_var_Dia_COP_h",
+            "c_var_Noche_COP_h",
+            "costo_fijo_diario_equipo_COP",
+            "horas_prorrateo_fijo",
+            "costo_fijo_COP_h",
+            "c_h_Dia_COP_h",
+            "c_h_Noche_COP_h",
+        ]
+        st.dataframe(preview_field[cost_preview_cols], use_container_width=True)
+        st.caption("Estos c_h efectivos son los parámetros que entran al MILP para calcular C_f.")
 except Exception as preview_exc:
     st.warning(f"Datos incompletos antes de resolver: {preview_exc}")
 
@@ -951,7 +1075,7 @@ if bundle is not None:
             st.download_button(
                 "Descargar reporte Excel multi-hoja",
                 data=excel_report,
-                file_name="reporte_muestreo_MILP_AHP_word_strict.xlsx",
+                file_name="reporte_muestreo_MILP_AHP_costo_equipo.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
                 on_click="ignore",
@@ -998,7 +1122,7 @@ else:
         """
         ### Flujo sugerido
         1. Descarga la plantilla estricta o usa **Ingresar manualmente**.
-        2. Define únicamente los parámetros del Word: conjuntos, costos por turno, tiempos por turno y pesos AHP.
+        2. Define únicamente los parámetros del Word: conjuntos, tiempos por turno, pesos AHP y costo horario efectivo del equipo. La app puede calcularlo desde costo variable horario + costo fijo diario prorrateado.
         3. Ejecuta la optimización.
         4. Descarga el reporte Excel multi-hoja; incluye una hoja `Modelo_usado` con las ecuaciones implementadas.
         """
