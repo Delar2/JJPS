@@ -10,7 +10,7 @@ from ortools.sat.python import cp_model
 
 
 st.set_page_config(
-    page_title="MILP-AHP | AHP local protegido",
+    page_title="MILP-AHP | AHP local protegido | factor solo campo",
     page_icon="🧪",
     layout="wide",
 )
@@ -40,8 +40,8 @@ if "last_solution_bundle" not in st.session_state:
 # del equipo. La app permite descomponerlo en:
 #   (costo variable horario por persona * número de personas)
 #   + costo fijo diario del equipo / horas de prorrateo.
-# Además aplica un factor global de costo total, por defecto 1.10,
-# sobre los costos de campo y laboratorio antes del presupuesto/AHP.
+# Además aplica un factor de costo de CAMPO, por defecto 1.10,
+# únicamente sobre los costos de campo. Laboratorio permanece con su costo unitario fijo.
 # =========================================================
 
 SHIFTS = ["Dia", "Noche"]
@@ -73,7 +73,7 @@ PARAM_DEFAULTS = [
     {"Parametro": "beta_F", "Descripcion": "Peso AHP de primer nivel del bloque campo", "Unidad": "proporcion", "Valor": 0.6420},
     {"Parametro": "beta_L", "Descripcion": "Peso AHP de primer nivel del bloque laboratorio", "Unidad": "proporcion", "Valor": 0.3580},
     {"Parametro": "n_personas_equipo", "Descripcion": "Número de personas por equipo; multiplica los costos variables de salario", "Unidad": "personas/equipo", "Valor": 2},
-    {"Parametro": "factor_costo_total", "Descripcion": "Factor multiplicador aplicado al costo total calculado", "Unidad": "factor", "Valor": 1.10},
+    {"Parametro": "factor_costo_campo", "Descripcion": "Factor multiplicador aplicado solo al costo de campo calculado", "Unidad": "factor", "Valor": 1.10},
 ]
 
 DEFAULT_CIRCLES = [
@@ -165,7 +165,7 @@ def build_template_excel_bytes() -> bytes:
         pd.DataFrame(DEFAULT_FIELD_ROWS).to_excel(writer, sheet_name="Campo", index=False)
         pd.DataFrame(DEFAULT_LAB_ROWS).to_excel(writer, sheet_name="Laboratorio", index=False)
         notes = pd.DataFrame([
-            {"Hoja": "Parametros", "Descripcion": "Debe conservar: Parametro, Descripcion, Unidad, Valor. Incluye T_max, H_turno, C_total, E_max, beta_F, beta_L, n_personas_equipo y factor_costo_total."},
+            {"Hoja": "Parametros", "Descripcion": "Debe conservar: Parametro, Descripcion, Unidad, Valor. Incluye T_max, H_turno, C_total, E_max, beta_F, beta_L, n_personas_equipo y factor_costo_campo."},
             {"Hoja": "Circulos", "Descripcion": "Conjunto I. Columnas: ID, Perimetro_m."},
             {"Hoja": "Separaciones", "Descripcion": "Conjunto S. Columna: separacion_m."},
             {"Hoja": "Campo", "Descripcion": "Conjunto F. Columnas: actividad, alpha_f, t_Dia_h, t_Noche_h, c_var_Dia_COP_h_persona, c_var_Noche_COP_h_persona, costo_fijo_diario_equipo_COP, horas_prorrateo_fijo. La app calcula c_h efectivo = c_var_persona*n_personas_equipo + fijo_diario/horas_prorrateo."},
@@ -497,8 +497,8 @@ def model_equations_table() -> pd.DataFrame:
         ("Integralidad", "sum_f z_i,f >= 1  para todo i"),
         ("Cantidad campo", "Q_f = sum_i sum_s n_i,s * y_i,f,s"),
         ("Costo horario efectivo", "c_h,f,w = n_personas_equipo*c_var_persona,h,f,w + F_diario_equipo,f / H_prorrateo,f"),
-        ("Costo campo", "C_f = factor_costo_total * Q_f * sum_w c_h,f,w * t_f,w"),
-        ("Costo lab", "C_k = factor_costo_total * c_lab,k * L_k"),
+        ("Costo campo", "C_f = factor_costo_campo * Q_f * sum_w c_h,f,w * t_f,w"),
+        ("Costo lab", "C_k = c_lab,k * L_k"),
         ("Agregados", "C_field=sum_f C_f; C_lab=sum_k C_k; C_used=C_field+C_lab"),
         ("Presupuesto", "C_used <= C_total"),
         ("Uso mínimo opcional", "C_used >= u_min*C_total. En v13 está desactivado por defecto porque puede distorsionar el AHP local"),
@@ -593,7 +593,7 @@ def solve_milp_ahp_word(
     time_limit_per_stage: int,
     min_budget_use_ratio: float = 0.0,
     n_personas_equipo: float = 1.0,
-    factor_costo_total: float = 1.0,
+    factor_costo_campo: float = 1.0,
 ) -> Dict:
     circles, separations, field_df, lab_df = clean_model_inputs(circles, pd.DataFrame({"separacion_m": separations}), field_df, lab_df, n_personas_equipo=n_personas_equipo)
 
@@ -608,7 +608,7 @@ def solve_milp_ahp_word(
     perimeter = dict(zip(I, circles["Perimetro_m"].astype(float)))
 
     budget = int(round(budget_cop))
-    factor_costo_total = max(0.0, float(factor_costo_total))
+    factor_costo_campo = max(0.0, float(factor_costo_campo))
     beta = {"Campo": int(round(beta_field * W_SCALE)), "Laboratorio": int(round(beta_lab * W_SCALE))}
     alpha = {row["actividad"]: int(round(row["alpha_f"] * W_SCALE)) for _, row in field_df.iterrows()}
     gamma = {row["analisis"]: int(round(row["gamma_k"] * W_SCALE)) for _, row in lab_df.iterrows()}
@@ -621,8 +621,7 @@ def solve_milp_ahp_word(
         t[(f, "Noche")] = int(round(float(row["t_Noche_h"])))
         c_h[(f, "Dia")] = int(round(float(row["c_h_Dia_COP_h"])))
         c_h[(f, "Noche")] = int(round(float(row["c_h_Noche_COP_h"])))
-    lab_cost_base = dict(zip(K, lab_df["c_lab_COP_muestra"].round().astype(int)))
-    lab_cost = {k: int(round(v * factor_costo_total)) for k, v in lab_cost_base.items()}
+    lab_cost = dict(zip(K, lab_df["c_lab_COP_muestra"].round().astype(int)))
     n = {(i, s): compute_n_points(perimeter[i], s) for i in I for s in separations}
 
     model = cp_model.CpModel()
@@ -654,9 +653,9 @@ def solve_milp_ahp_word(
     # 4.3 Cantidades de campo
     for f in F:
         model.Add(Q[f] == sum(n[(i, s)] * y[(i, f, s)] for i in I for s in separations))
-        # 4.4 Costos de campo: C_f = factor_costo_total * sum_w c_h,w * t_f,w * Q_f
+        # 4.4 Costos de campo: C_f = factor_costo_campo * sum_w c_h,w * t_f,w * Q_f
         cost_per_unit_base = sum(c_h[(f, w)] * t[(f, w)] for w in W)
-        cost_per_unit = int(round(cost_per_unit_base * factor_costo_total))
+        cost_per_unit = int(round(cost_per_unit_base * factor_costo_campo))
         model.Add(Cf[f] == cost_per_unit * Q[f])
 
     # 4.5 Costos de laboratorio
@@ -747,7 +746,7 @@ def solve_milp_ahp_word(
             cost = int(solver.Value(Cf[f]))
             input_row = field_df[field_df["actividad"] == f].iloc[0]
             cost_unit_base = sum(c_h[(f, w)] * t[(f, w)] for w in W)
-            cost_unit = int(round(cost_unit_base * factor_costo_total))
+            cost_unit = int(round(cost_unit_base * factor_costo_campo))
             field_rows.append({
                 "actividad": f,
                 "cantidad_Q": q,
@@ -765,7 +764,7 @@ def solve_milp_ahp_word(
                 "c_h_Dia_efectivo_COP_h": int(round(c_h[(f, "Dia")])),
                 "c_h_Noche_efectivo_COP_h": int(round(c_h[(f, "Noche")])),
                 "costo_unitario_base_COP_punto": int(round(cost_unit_base)),
-                "factor_costo_total": factor_costo_total,
+                "factor_costo_campo": factor_costo_campo,
                 "costo_unitario_campo_COP_punto": int(round(cost_unit)),
                 "costo_COP": cost,
                 "alpha_f": alpha[f] / W_SCALE,
@@ -780,9 +779,8 @@ def solve_milp_ahp_word(
             lab_rows.append({
                 "analisis": k,
                 "muestras_L": int(solver.Value(L[k])),
-                "costo_unitario_base_COP_muestra": int(lab_cost_base[k]),
-                "factor_costo_total": factor_costo_total,
-                "costo_unitario_ajustado_COP_muestra": int(lab_cost[k]),
+                "costo_unitario_COP_muestra": int(lab_cost[k]),
+                "factor_costo_campo_aplica_a_lab": 1.0,
                 "costo_COP": cost,
                 "gamma_k": gamma[k] / W_SCALE,
                 "participacion_objetivo_lab": gamma[k] / W_SCALE,
@@ -800,7 +798,7 @@ def solve_milp_ahp_word(
                         day_h = points * t[(f, "Dia")]
                         night_h = points * t[(f, "Noche")]
                         cost_base = points * sum(c_h[(f, w)] * t[(f, w)] for w in W)
-                        cost = int(round(cost_base * factor_costo_total))
+                        cost = int(round(cost_base * factor_costo_campo))
                         plan_rows.append({
                             "circulo": i,
                             "perimetro_m": perimeter[i],
@@ -836,7 +834,7 @@ def solve_milp_ahp_word(
                 "Uso presupuesto %": cused_val / max(1, budget),
                 "Presupuesto no usado": max(0, budget - cused_val),
                 "Número personas por equipo": float(n_personas_equipo),
-                "Factor costo total": float(factor_costo_total),
+                "Factor costo campo": float(factor_costo_campo),
                 "Campo real %": cfield_val / max(1, cused_val),
                 "Lab real %": clab_val / max(1, cused_val),
                 "Campo objetivo AHP %": beta["Campo"] / W_SCALE,
@@ -910,14 +908,14 @@ def solve_milp_ahp_word(
 # -----------------------------
 
 st.title("🧪 Optimización MILP-AHP para estrategias de muestreo")
-st.caption("Versión basada en la formulación Word: turnos Día/Noche, sin mínimos, costo horario efectivo por equipo y AHP local protegido. El piso de presupuesto queda desactivado por defecto.")
+st.caption("Versión basada en la formulación Word: turnos Día/Noche, sin mínimos, costo horario efectivo por equipo y AHP local protegido | factor solo campo. El piso de presupuesto queda desactivado por defecto.")
 
 with st.sidebar:
     st.header("1) Datos")
     st.download_button(
         "📥 Descargar plantilla Excel estricta",
         data=build_template_excel_bytes(),
-        file_name="Data_template_MILP_AHP_v13_AHP_local_protegido.xlsx",
+        file_name="Data_template_MILP_AHP_v14_factor_solo_campo.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
         on_click="ignore",
@@ -977,7 +975,7 @@ with c6:
 with c7:
     n_people = st.number_input("Personas por equipo", value=float(_safe_float(params.get("n_personas_equipo"), 2)), min_value=1.0, step=1.0, format="%.0f")
 with c8:
-    cost_factor = st.number_input("Factor costo total", value=float(_safe_float(params.get("factor_costo_total"), 1.10)), min_value=0.0, step=0.01, format="%.2f")
+    cost_factor = st.number_input("Factor costo campo", value=float(_safe_float(params.get("factor_costo_campo", params.get("factor_costo_total", 1.10)), 1.10)), min_value=0.0, step=0.01, format="%.2f")
 
 if abs((float(beta_f) + float(beta_l)) - 1.0) > 0.02:
     st.warning(f"β_F + β_L debería sumar 1 según el Word. Suma actual: {float(beta_f)+float(beta_l):.4f}.")
@@ -1001,7 +999,7 @@ with st.expander("S: Separaciones permitidas", expanded=False):
 left, right = st.columns(2)
 with left:
     st.markdown("### F: Actividades de campo")
-    st.caption("No hay mínimos y no se pregunta si produce muestra. La app calcula c_h efectivo = costo variable por persona × personas por equipo + costo fijo diario del equipo / horas de prorrateo. Luego multiplica el costo final por el factor de costo total.")
+    st.caption("No hay mínimos y no se pregunta si produce muestra. La app calcula c_h efectivo = costo variable por persona × personas por equipo + costo fijo diario del equipo / horas de prorrateo. Luego multiplica SOLO el costo de campo por el factor de costo campo. Laboratorio mantiene su costo unitario fijo.")
     field_df = st.data_editor(
         parsed.field_df,
         num_rows="dynamic",
@@ -1068,7 +1066,7 @@ if run:
             "beta_F": float(beta_f),
             "beta_L": float(beta_l),
             "n_personas_equipo": float(n_people),
-            "factor_costo_total": float(cost_factor),
+            "factor_costo_campo": float(cost_factor),
             "separaciones": ", ".join(map(str, sep_list)),
             "uso_minimo_presupuesto_calibracion": float(min_budget_pct) / 100.0,
         }
@@ -1087,7 +1085,7 @@ if run:
                 time_limit_per_stage=int(time_limit),
                 min_budget_use_ratio=float(min_budget_pct) / 100.0,
                 n_personas_equipo=float(n_people),
-                factor_costo_total=float(cost_factor),
+                factor_costo_campo=float(cost_factor),
             )
     except Exception as exc:
         st.session_state.last_solution_bundle = None
