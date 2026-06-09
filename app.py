@@ -10,7 +10,7 @@ from ortools.sat.python import cp_model
 
 
 st.set_page_config(
-    page_title="MILP-AHP | Costos directos + presupuesto opcional",
+    page_title="MILP-AHP | Costo diario directo",
     page_icon="🧪",
     layout="wide",
 )
@@ -45,9 +45,6 @@ W_SCALE = 10_000
 # muy pequeña de conservación de coherencia para poder exprimir el presupuesto.
 LEXI_TOL_PCT = 0.0025  # 0.25 % del presupuesto, expresado en unidades escaladas
 TARGET_BUDGET_USE = 0.995  # se considera saturado si usa al menos 99.5 %
-# Opción práctica (no obligatoria): fuerza que las etapas AHP se calibren
-# cerca de un uso mínimo del presupuesto. Por defecto queda desactivada (0 %).
-DEFAULT_MIN_BUDGET_USE = 0.0
 DEFAULT_COSTO_DIA_COP_H = int(round(1_500_000 / 9))  # 166667 COP/h aprox.
 DEFAULT_COSTO_NOCHE_COP_H = 250_000
 
@@ -69,7 +66,6 @@ PARAM_DEFAULTS = [
     {"Parametro": "beta_F", "Descripcion": "Peso AHP de primer nivel del bloque campo", "Unidad": "proporcion", "Valor": 0.6420},
     {"Parametro": "beta_L", "Descripcion": "Peso AHP de primer nivel del bloque laboratorio", "Unidad": "proporcion", "Valor": 0.3580},
     {"Parametro": "factor_costo_campo", "Descripcion": "Factor multiplicador aplicado solo al costo de campo calculado", "Unidad": "factor", "Valor": 1.10},
-    {"Parametro": "uso_minimo_presupuesto_AHP", "Descripcion": "Uso mínimo opcional del presupuesto durante calibración AHP; 0 lo desactiva", "Unidad": "proporcion", "Valor": 0.0},
 ]
 
 DEFAULT_CIRCLES = [
@@ -125,7 +121,7 @@ def build_template_excel_bytes() -> bytes:
         pd.DataFrame(DEFAULT_FIELD_ROWS).to_excel(writer, sheet_name="Campo", index=False)
         pd.DataFrame(DEFAULT_LAB_ROWS).to_excel(writer, sheet_name="Laboratorio", index=False)
         notes = pd.DataFrame([
-            {"Hoja": "Parametros", "Descripcion": "Debe conservar: Parametro, Descripcion, Unidad, Valor. Incluye T_max, H_turno, C_total, E_max, beta_F, beta_L, factor_costo_campo y uso_minimo_presupuesto_AHP opcional."},
+            {"Hoja": "Parametros", "Descripcion": "Debe conservar: Parametro, Descripcion, Unidad, Valor. Incluye T_max, H_turno, C_total, E_max, beta_F, beta_L y factor_costo_campo."},
             {"Hoja": "Circulos", "Descripcion": "Conjunto I. Columnas: ID, Perimetro_m."},
             {"Hoja": "Separaciones", "Descripcion": "Conjunto S. Columna: separacion_m."},
             {"Hoja": "Campo", "Descripcion": "Conjunto F. Columnas: actividad, alpha_f, t_Dia_h, t_Noche_h, c_h_Dia_COP_h, c_h_Noche_COP_h. No hay mínimos, produce_muestra_lab, costos fijos ni prorrateo. Los c_h se ingresan directamente como COP/h del equipo."},
@@ -366,7 +362,6 @@ def model_equations_table() -> pd.DataFrame:
         ("Costo lab", "C_k = c_lab,k * L_k"),
         ("Agregados", "C_field=sum_f C_f; C_lab=sum_k C_k; C_used=C_field+C_lab"),
         ("Presupuesto", "C_used <= C_total"),
-        ("Uso mínimo opcional", "C_used >= u_min*C_total, si se activa en la interfaz"),
         ("Capacidad", "sum_f t_f,w * Q_f <= E_w * T_max * H_turno  para todo w"),
         ("Equipos", "E_w <= E_max  para todo w"),
         ("Conservación", "sum_k L_k <= sum_f Q_f"),
@@ -455,7 +450,6 @@ def solve_milp_ahp_word(
     beta_lab: float,
     time_limit_per_stage: int,
     factor_costo_campo: float = 1.0,
-    min_budget_use_ratio: float = 0.0,
 ) -> Dict:
     circles, separations, field_df, lab_df = clean_model_inputs(circles, pd.DataFrame({"separacion_m": separations}), field_df, lab_df)
 
@@ -529,14 +523,6 @@ def solve_milp_ahp_word(
     model.Add(Clab == sum(Ck[k] for k in K))
     model.Add(Cused == Cfield + Clab)
     model.Add(Cused <= budget)
-
-    # Uso mínimo opcional de presupuesto durante la calibración AHP.
-    # Si queda en 0 %, no añade ninguna restricción.
-    # Sirve para evitar que las etapas 1 y 2 elijan una solución muy pequeña
-    # solo porque minimiza mejor las desviaciones absolutas en COP.
-    min_budget_use_ratio = max(0.0, min(1.0, float(min_budget_use_ratio)))
-    if min_budget_use_ratio > 0:
-        model.Add(Cused >= int(round(budget * min_budget_use_ratio)))
 
     # 4.8 Capacidad operativa por turno: sum_f t_f,w Q_f <= E_w*Tmax*H_turno
     for w in W:
@@ -779,15 +765,6 @@ with st.sidebar:
 
     st.header("2) Solver")
     time_limit = st.slider("Tiempo máximo por etapa (s)", min_value=3, max_value=180, value=20, step=1)
-    default_min_budget_pct = int(round(100 * _safe_float(PARAM_DEFAULTS[-1]["Valor"], DEFAULT_MIN_BUDGET_USE)))
-    min_budget_pct = st.slider(
-        "Uso mínimo de presupuesto para calibrar AHP (%)",
-        min_value=0, max_value=100, value=default_min_budget_pct, step=1,
-        help=(
-            "Opcional. Si es mayor que 0, obliga a que las etapas AHP se resuelvan con al menos ese porcentaje del presupuesto. "
-            "Úsalo para evitar soluciones muy pequeñas; si desajusta mucho el AHP o vuelve infactible el modelo, bájalo."
-        ),
-    )
 
 if data_mode == "Subir Excel":
     if uploaded is None:
@@ -894,7 +871,6 @@ if run:
             "beta_F": float(beta_f),
             "beta_L": float(beta_l),
             "factor_costo_campo": float(cost_factor),
-            "uso_minimo_presupuesto_AHP": float(min_budget_pct) / 100.0,
             "separaciones": ", ".join(map(str, sep_list)),
         }
         with st.spinner("Resolviendo modelo lexicográfico según formulación Word..."):
@@ -911,7 +887,6 @@ if run:
                 beta_lab=float(beta_l),
                 time_limit_per_stage=int(time_limit),
                 factor_costo_campo=float(cost_factor),
-                min_budget_use_ratio=float(min_budget_pct) / 100.0,
             )
     except Exception as exc:
         st.session_state.last_solution_bundle = None
@@ -1043,7 +1018,7 @@ else:
         """
         ### Flujo sugerido
         1. Descarga la plantilla estricta o usa **Ingresar manualmente**.
-        2. Define los parámetros: conjuntos, tiempos por turno, pesos AHP, costos horarios directos del equipo y, si lo necesitas, el uso mínimo opcional de presupuesto para calibrar AHP.
+        2. Define únicamente los parámetros del Word: conjuntos, tiempos por turno, pesos AHP y costos horarios directos del equipo.
         3. Ejecuta la optimización.
         4. Descarga el reporte Excel multi-hoja; incluye una hoja `Modelo_usado` con las ecuaciones implementadas.
         """
