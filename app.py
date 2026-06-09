@@ -10,7 +10,7 @@ from ortools.sat.python import cp_model
 
 
 st.set_page_config(
-    page_title="MILP-AHP | AHP local protegido | factor solo campo",
+    page_title="MILP-AHP | Costo diario directo",
     page_icon="🧪",
     layout="wide",
 )
@@ -21,7 +21,7 @@ if "last_solution_bundle" not in st.session_state:
     st.session_state.last_solution_bundle = None
 
 # =========================================================
-# CONFIGURACIÓN ESTRICTA SEGÚN FORMULACIÓN WORD
+# CONFIGURACIÓN SEGÚN FORMULACIÓN WORD — COSTOS DIRECTOS POR HORA
 # =========================================================
 # Conjuntos:
 # I = círculos; S = separaciones; F = actividades de campo;
@@ -34,14 +34,6 @@ if "last_solution_bundle" not in st.session_state:
 # - no usa selector floor/ceil/round: aplica n_i,s = max(1, floor(P_i/s))
 # - no permite cambiar la lógica de activación del círculo
 # - conservación de muestras: sum_k L_k <= sum_f Q_f
-#
-# Ajuste v12:
-# El parámetro c_h,f,w del Word se interpreta como costo horario EFECTIVO
-# del equipo. La app permite descomponerlo en:
-#   (costo variable horario por persona * número de personas)
-#   + costo fijo diario del equipo / horas de prorrateo.
-# Además aplica un factor de costo de CAMPO, por defecto 1.10,
-# únicamente sobre los costos de campo. Laboratorio permanece con su costo unitario fijo.
 # =========================================================
 
 SHIFTS = ["Dia", "Noche"]
@@ -53,7 +45,8 @@ W_SCALE = 10_000
 # muy pequeña de conservación de coherencia para poder exprimir el presupuesto.
 LEXI_TOL_PCT = 0.0025  # 0.25 % del presupuesto, expresado en unidades escaladas
 TARGET_BUDGET_USE = 0.995  # se considera saturado si usa al menos 99.5 %
-DEFAULT_MIN_BUDGET_USE = 0.0  # v13: por defecto NO se fuerza un piso de presupuesto porque puede distorsionar el AHP local
+DEFAULT_COSTO_DIA_COP_H = int(round(1_500_000 / 9))  # 166667 COP/h aprox.
+DEFAULT_COSTO_NOCHE_COP_H = 250_000
 
 
 @dataclass
@@ -72,7 +65,6 @@ PARAM_DEFAULTS = [
     {"Parametro": "E_max", "Descripcion": "Número máximo de equipos de trabajo disponibles por turno", "Unidad": "equipos", "Valor": 2},
     {"Parametro": "beta_F", "Descripcion": "Peso AHP de primer nivel del bloque campo", "Unidad": "proporcion", "Valor": 0.6420},
     {"Parametro": "beta_L", "Descripcion": "Peso AHP de primer nivel del bloque laboratorio", "Unidad": "proporcion", "Valor": 0.3580},
-    {"Parametro": "n_personas_equipo", "Descripcion": "Número de personas por equipo; multiplica los costos variables de salario", "Unidad": "personas/equipo", "Valor": 2},
     {"Parametro": "factor_costo_campo", "Descripcion": "Factor multiplicador aplicado solo al costo de campo calculado", "Unidad": "factor", "Valor": 1.10},
 ]
 
@@ -89,46 +81,10 @@ DEFAULT_SEPARATIONS = [
 ]
 
 DEFAULT_FIELD_ROWS = [
-    {
-        "actividad": "Muestreo puntual estándar",
-        "alpha_f": 0.3758,
-        "t_Dia_h": 1,
-        "t_Noche_h": 0,
-        "c_var_Dia_COP_h_persona": 13333.33,
-        "c_var_Noche_COP_h_persona": 0.0,
-        "costo_fijo_diario_equipo_COP": 766600.0,
-        "horas_prorrateo_fijo": 9,
-    },
-    {
-        "actividad": "Muestreo multinivel",
-        "alpha_f": 0.3154,
-        "t_Dia_h": 3,
-        "t_Noche_h": 0,
-        "c_var_Dia_COP_h_persona": 13333.33,
-        "c_var_Noche_COP_h_persona": 0.0,
-        "costo_fijo_diario_equipo_COP": 766600.0,
-        "horas_prorrateo_fijo": 9,
-    },
-    {
-        "actividad": "Medición 24 horas",
-        "alpha_f": 0.2268,
-        "t_Dia_h": 15,
-        "t_Noche_h": 9,
-        "c_var_Dia_COP_h_persona": 20750.0,
-        "c_var_Noche_COP_h_persona": 27125.0,
-        "costo_fijo_diario_equipo_COP": 766600.0,
-        "horas_prorrateo_fijo": 24,
-    },
-    {
-        "actividad": "Medición extendida",
-        "alpha_f": 0.0820,
-        "t_Dia_h": 60,
-        "t_Noche_h": 61,
-        "c_var_Dia_COP_h_persona": 20750.0,
-        "c_var_Noche_COP_h_persona": 27125.0,
-        "costo_fijo_diario_equipo_COP": 766600.0,
-        "horas_prorrateo_fijo": 121,
-    },
+    {"actividad": "Muestreo puntual estándar", "alpha_f": 0.3758, "t_Dia_h": 1, "t_Noche_h": 0, "c_h_Dia_COP_h": DEFAULT_COSTO_DIA_COP_H, "c_h_Noche_COP_h": DEFAULT_COSTO_NOCHE_COP_H},
+    {"actividad": "Muestreo multinivel", "alpha_f": 0.3154, "t_Dia_h": 3, "t_Noche_h": 0, "c_h_Dia_COP_h": DEFAULT_COSTO_DIA_COP_H, "c_h_Noche_COP_h": DEFAULT_COSTO_NOCHE_COP_H},
+    {"actividad": "Medición 24 horas", "alpha_f": 0.2268, "t_Dia_h": 15, "t_Noche_h": 9, "c_h_Dia_COP_h": DEFAULT_COSTO_DIA_COP_H, "c_h_Noche_COP_h": DEFAULT_COSTO_NOCHE_COP_H},
+    {"actividad": "Medición extendida", "alpha_f": 0.0820, "t_Dia_h": 60, "t_Noche_h": 61, "c_h_Dia_COP_h": DEFAULT_COSTO_DIA_COP_H, "c_h_Noche_COP_h": DEFAULT_COSTO_NOCHE_COP_H},
 ]
 
 DEFAULT_LAB_ROWS = [
@@ -165,10 +121,10 @@ def build_template_excel_bytes() -> bytes:
         pd.DataFrame(DEFAULT_FIELD_ROWS).to_excel(writer, sheet_name="Campo", index=False)
         pd.DataFrame(DEFAULT_LAB_ROWS).to_excel(writer, sheet_name="Laboratorio", index=False)
         notes = pd.DataFrame([
-            {"Hoja": "Parametros", "Descripcion": "Debe conservar: Parametro, Descripcion, Unidad, Valor. Incluye T_max, H_turno, C_total, E_max, beta_F, beta_L, n_personas_equipo y factor_costo_campo."},
+            {"Hoja": "Parametros", "Descripcion": "Debe conservar: Parametro, Descripcion, Unidad, Valor. Incluye T_max, H_turno, C_total, E_max, beta_F, beta_L y factor_costo_campo."},
             {"Hoja": "Circulos", "Descripcion": "Conjunto I. Columnas: ID, Perimetro_m."},
             {"Hoja": "Separaciones", "Descripcion": "Conjunto S. Columna: separacion_m."},
-            {"Hoja": "Campo", "Descripcion": "Conjunto F. Columnas: actividad, alpha_f, t_Dia_h, t_Noche_h, c_var_Dia_COP_h_persona, c_var_Noche_COP_h_persona, costo_fijo_diario_equipo_COP, horas_prorrateo_fijo. La app calcula c_h efectivo = c_var_persona*n_personas_equipo + fijo_diario/horas_prorrateo."},
+            {"Hoja": "Campo", "Descripcion": "Conjunto F. Columnas: actividad, alpha_f, t_Dia_h, t_Noche_h, c_h_Dia_COP_h, c_h_Noche_COP_h. No hay mínimos, produce_muestra_lab, costos fijos ni prorrateo. Los c_h se ingresan directamente como COP/h del equipo."},
             {"Hoja": "Laboratorio", "Descripcion": "Conjunto K. Columnas: analisis, gamma_k, c_lab_COP_muestra."},
             {"Hoja": "Modelo", "Descripcion": "Conservación: sum_k L_k <= sum_f Q_f. Todas las actividades de campo aportan a sum_f Q_f."},
         ])
@@ -237,48 +193,10 @@ def parse_excel(file_obj) -> ParsedData:
     separations.columns = ["separacion_m"]
 
     field_df = xls.parse(sheet_map["campo"])
-    # Preferimos leer por nombres de columnas para evitar que un cambio de orden
-    # en Excel rompa el modelo. También aceptamos formatos viejos.
-    rename_map = {
-        "c_var_Dia_COP_h": "c_var_Dia_COP_h_persona",
-        "c_var_Noche_COP_h": "c_var_Noche_COP_h_persona",
-    }
-    field_df = field_df.rename(columns=rename_map)
-    required_new = [
-        "actividad",
-        "alpha_f",
-        "t_Dia_h",
-        "t_Noche_h",
-        "c_var_Dia_COP_h_persona",
-        "c_var_Noche_COP_h_persona",
-        "costo_fijo_diario_equipo_COP",
-        "horas_prorrateo_fijo",
-    ]
-    if set(required_new).issubset(set(field_df.columns)):
-        field_df = field_df[required_new].copy()
-    elif {"actividad", "alpha_f", "t_Dia_h", "t_Noche_h", "c_h_Dia_COP_h", "c_h_Noche_COP_h"}.issubset(set(field_df.columns)):
-        # Compatibilidad con formato anterior estricto: c_h ya era costo horario efectivo.
-        field_df = field_df[["actividad", "alpha_f", "t_Dia_h", "t_Noche_h", "c_h_Dia_COP_h", "c_h_Noche_COP_h"]].copy()
-        field_df = field_df.rename(columns={
-            "c_h_Dia_COP_h": "c_var_Dia_COP_h_persona",
-            "c_h_Noche_COP_h": "c_var_Noche_COP_h_persona",
-        })
-        field_df["costo_fijo_diario_equipo_COP"] = 0.0
-        field_df["horas_prorrateo_fijo"] = 1.0
-        field_df["_c_var_ya_es_equipo"] = True
-    elif len(field_df.columns) >= 8:
-        field_df = field_df.iloc[:, :8].copy()
-        field_df.columns = required_new
-    elif len(field_df.columns) >= 6:
-        field_df = field_df.iloc[:, :6].copy()
-        field_df.columns = ["actividad", "alpha_f", "t_Dia_h", "t_Noche_h", "c_var_Dia_COP_h_persona", "c_var_Noche_COP_h_persona"]
-        field_df["costo_fijo_diario_equipo_COP"] = 0.0
-        field_df["horas_prorrateo_fijo"] = 1.0
-    else:
-        raise ValueError(
-            "La hoja Campo debe tener columnas: actividad, alpha_f, t_Dia_h, t_Noche_h, "
-            "c_var_Dia_COP_h_persona, c_var_Noche_COP_h_persona, costo_fijo_diario_equipo_COP, horas_prorrateo_fijo."
-        )
+    if len(field_df.columns) < 6:
+        raise ValueError("La hoja Campo debe tener columnas: actividad, alpha_f, t_Dia_h, t_Noche_h, c_h_Dia_COP_h, c_h_Noche_COP_h.")
+    field_df = field_df.iloc[:, :6].copy()
+    field_df.columns = ["actividad", "alpha_f", "t_Dia_h", "t_Noche_h", "c_h_Dia_COP_h", "c_h_Noche_COP_h"]
 
     lab_df = xls.parse(sheet_map["laboratorio"])
     if len(lab_df.columns) < 3:
@@ -294,7 +212,6 @@ def clean_model_inputs(
     separations: pd.DataFrame,
     field_df: pd.DataFrame,
     lab_df: pd.DataFrame,
-    n_personas_equipo: float = 1.0,
 ) -> Tuple[pd.DataFrame, List[int], pd.DataFrame, pd.DataFrame]:
     circles = circles.copy()
     separations = separations.copy()
@@ -313,70 +230,15 @@ def clean_model_inputs(
     sep = pd.to_numeric(separations["separacion_m"], errors="coerce").dropna()
     sep = sorted(set(int(round(x)) for x in sep if x > 0))
 
-    # Formato v12: se ingresa costo variable horario por persona + costo fijo diario por equipo.
-    # La app calcula el costo horario efectivo c_h,f,w que entra en el MILP.
-    # Compatibilidad: si llega una plantilla vieja con c_var_Dia_COP_h, se interpreta
-    # como costo variable por persona. Si llega c_h_Dia_COP_h, se interpreta como
-    # costo horario efectivo ya calculado y se evita multiplicarlo por personas.
-    if "c_var_Dia_COP_h" in field_df.columns and "c_var_Dia_COP_h_persona" not in field_df.columns:
-        field_df = field_df.rename(columns={
-            "c_var_Dia_COP_h": "c_var_Dia_COP_h_persona",
-            "c_var_Noche_COP_h": "c_var_Noche_COP_h_persona",
-        })
-    if "_c_var_ya_es_equipo" not in field_df.columns:
-        field_df["_c_var_ya_es_equipo"] = False
-    if "c_h_Dia_COP_h" in field_df.columns and "c_var_Dia_COP_h_persona" not in field_df.columns:
-        field_df = field_df.rename(columns={
-            "c_h_Dia_COP_h": "c_var_Dia_COP_h_persona",
-            "c_h_Noche_COP_h": "c_var_Noche_COP_h_persona",
-        })
-        field_df["costo_fijo_diario_equipo_COP"] = 0.0
-        field_df["horas_prorrateo_fijo"] = 1.0
-        field_df["_c_var_ya_es_equipo"] = True
-
-    required_field = [
-        "actividad",
-        "alpha_f",
-        "t_Dia_h",
-        "t_Noche_h",
-        "c_var_Dia_COP_h_persona",
-        "c_var_Noche_COP_h_persona",
-        "costo_fijo_diario_equipo_COP",
-        "horas_prorrateo_fijo",
-    ]
+    required_field = ["actividad", "alpha_f", "t_Dia_h", "t_Noche_h", "c_h_Dia_COP_h", "c_h_Noche_COP_h"]
     for col in required_field:
         if col not in field_df.columns:
             raise ValueError(f"La tabla Campo debe contener la columna {col}.")
     field_df["actividad"] = _clean_name_series(field_df["actividad"])
     field_df = field_df[field_df["actividad"] != ""].copy()
-    for col in [
-        "alpha_f",
-        "t_Dia_h",
-        "t_Noche_h",
-        "c_var_Dia_COP_h_persona",
-        "c_var_Noche_COP_h_persona",
-        "costo_fijo_diario_equipo_COP",
-        "horas_prorrateo_fijo",
-    ]:
+    for col in ["alpha_f", "t_Dia_h", "t_Noche_h", "c_h_Dia_COP_h", "c_h_Noche_COP_h"]:
         field_df[col] = pd.to_numeric(field_df[col], errors="coerce").fillna(0)
-    field_df = field_df[(field_df["t_Dia_h"] + field_df["t_Noche_h"]) > 0].copy()
-    field_df = field_df[field_df["horas_prorrateo_fijo"] > 0].copy()
-    n_personas_equipo = max(0.0, float(n_personas_equipo))
-    if "_c_var_ya_es_equipo" not in field_df.columns:
-        field_df["_c_var_ya_es_equipo"] = False
-    field_df["n_personas_equipo"] = n_personas_equipo
-    field_df["c_var_Dia_equipo_COP_h"] = field_df.apply(
-        lambda r: r["c_var_Dia_COP_h_persona"] if bool(r.get("_c_var_ya_es_equipo", False)) else r["c_var_Dia_COP_h_persona"] * n_personas_equipo,
-        axis=1,
-    )
-    field_df["c_var_Noche_equipo_COP_h"] = field_df.apply(
-        lambda r: r["c_var_Noche_COP_h_persona"] if bool(r.get("_c_var_ya_es_equipo", False)) else r["c_var_Noche_COP_h_persona"] * n_personas_equipo,
-        axis=1,
-    )
-    field_df["costo_fijo_COP_h"] = field_df["costo_fijo_diario_equipo_COP"] / field_df["horas_prorrateo_fijo"]
-    field_df["c_h_Dia_COP_h"] = field_df["c_var_Dia_equipo_COP_h"] + field_df["costo_fijo_COP_h"]
-    field_df["c_h_Noche_COP_h"] = field_df["c_var_Noche_equipo_COP_h"] + field_df["costo_fijo_COP_h"]
-    field_df = field_df.reset_index(drop=True)
+    field_df = field_df[(field_df["t_Dia_h"] + field_df["t_Noche_h"]) > 0].reset_index(drop=True)
 
     required_lab = ["analisis", "gamma_k", "c_lab_COP_muestra"]
     for col in required_lab:
@@ -496,12 +358,10 @@ def model_equations_table() -> pd.DataFrame:
         ("Activación", "sum_s y_i,f,s = z_i,f  para todo i,f"),
         ("Integralidad", "sum_f z_i,f >= 1  para todo i"),
         ("Cantidad campo", "Q_f = sum_i sum_s n_i,s * y_i,f,s"),
-        ("Costo horario efectivo", "c_h,f,w = n_personas_equipo*c_var_persona,h,f,w + F_diario_equipo,f / H_prorrateo,f"),
         ("Costo campo", "C_f = factor_costo_campo * Q_f * sum_w c_h,f,w * t_f,w"),
         ("Costo lab", "C_k = c_lab,k * L_k"),
         ("Agregados", "C_field=sum_f C_f; C_lab=sum_k C_k; C_used=C_field+C_lab"),
         ("Presupuesto", "C_used <= C_total"),
-        ("Uso mínimo opcional", "C_used >= u_min*C_total. En v13 está desactivado por defecto porque puede distorsionar el AHP local"),
         ("Capacidad", "sum_f t_f,w * Q_f <= E_w * T_max * H_turno  para todo w"),
         ("Equipos", "E_w <= E_max  para todo w"),
         ("Conservación", "sum_k L_k <= sum_f Q_f"),
@@ -537,8 +397,6 @@ def build_excel_report(result: Dict, field_input_df: pd.DataFrame, lab_input_df:
         for name, df in [
             ("Parametros_usados", params_df),
             ("Modelo_usado", equations),
-            ("Input_Campo_costos", field_input_df),
-            ("Input_Laboratorio", lab_input_df),
             ("Plan_completo", plan),
             ("Campo_resumen", field),
             ("Laboratorio_resumen", lab),
@@ -591,11 +449,9 @@ def solve_milp_ahp_word(
     beta_field: float,
     beta_lab: float,
     time_limit_per_stage: int,
-    min_budget_use_ratio: float = 0.0,
-    n_personas_equipo: float = 1.0,
     factor_costo_campo: float = 1.0,
 ) -> Dict:
-    circles, separations, field_df, lab_df = clean_model_inputs(circles, pd.DataFrame({"separacion_m": separations}), field_df, lab_df, n_personas_equipo=n_personas_equipo)
+    circles, separations, field_df, lab_df = clean_model_inputs(circles, pd.DataFrame({"separacion_m": separations}), field_df, lab_df)
 
     validate_weight_sum("beta_F + beta_L", beta_field + beta_lab)
     validate_weight_sum("sum_f alpha_f", float(field_df["alpha_f"].sum()))
@@ -656,7 +512,7 @@ def solve_milp_ahp_word(
         # 4.4 Costos de campo: C_f = factor_costo_campo * sum_w c_h,w * t_f,w * Q_f
         cost_per_unit_base = sum(c_h[(f, w)] * t[(f, w)] for w in W)
         cost_per_unit = int(round(cost_per_unit_base * factor_costo_campo))
-        model.Add(Cf[f] == cost_per_unit * Q[f])
+        model.Add(Cf[f] == int(cost_per_unit) * Q[f])
 
     # 4.5 Costos de laboratorio
     for k in K:
@@ -667,13 +523,6 @@ def solve_milp_ahp_word(
     model.Add(Clab == sum(Ck[k] for k in K))
     model.Add(Cused == Cfield + Clab)
     model.Add(Cused <= budget)
-    # v11: Si se exige un uso mínimo de presupuesto, las etapas 1 y 2
-    # ya se calibran cerca del tamaño real de campaña. Esto evita que
-    # la minimización de desviaciones absolutas en COP prefiera una solución
-    # pequeña con desviación absoluta baja y bloquee la etapa 3.
-    min_budget_use_ratio = max(0.0, min(1.0, float(min_budget_use_ratio)))
-    if min_budget_use_ratio > 0:
-        model.Add(Cused >= int(round(budget * min_budget_use_ratio)))
 
     # 4.8 Capacidad operativa por turno: sum_f t_f,w Q_f <= E_w*Tmax*H_turno
     for w in W:
@@ -744,7 +593,6 @@ def solve_milp_ahp_word(
             day_h = int(t[(f, "Dia")] * q)
             night_h = int(t[(f, "Noche")] * q)
             cost = int(solver.Value(Cf[f]))
-            input_row = field_df[field_df["actividad"] == f].iloc[0]
             cost_unit_base = sum(c_h[(f, w)] * t[(f, w)] for w in W)
             cost_unit = int(round(cost_unit_base * factor_costo_campo))
             field_rows.append({
@@ -753,16 +601,8 @@ def solve_milp_ahp_word(
                 "tiempo_dia_h": day_h,
                 "tiempo_noche_h": night_h,
                 "tiempo_total_h": day_h + night_h,
-                "c_var_Dia_COP_h_persona": float(input_row["c_var_Dia_COP_h_persona"]),
-                "c_var_Noche_COP_h_persona": float(input_row["c_var_Noche_COP_h_persona"]),
-                "n_personas_equipo": float(input_row["n_personas_equipo"]),
-                "c_var_Dia_equipo_COP_h": float(input_row["c_var_Dia_equipo_COP_h"]),
-                "c_var_Noche_equipo_COP_h": float(input_row["c_var_Noche_equipo_COP_h"]),
-                "costo_fijo_diario_equipo_COP": float(input_row["costo_fijo_diario_equipo_COP"]),
-                "horas_prorrateo_fijo": float(input_row["horas_prorrateo_fijo"]),
-                "costo_fijo_COP_h": float(input_row["costo_fijo_COP_h"]),
-                "c_h_Dia_efectivo_COP_h": int(round(c_h[(f, "Dia")])),
-                "c_h_Noche_efectivo_COP_h": int(round(c_h[(f, "Noche")])),
+                "c_h_Dia_COP_h": int(round(c_h[(f, "Dia")])),
+                "c_h_Noche_COP_h": int(round(c_h[(f, "Noche")])),
                 "costo_unitario_base_COP_punto": int(round(cost_unit_base)),
                 "factor_costo_campo": factor_costo_campo,
                 "costo_unitario_campo_COP_punto": int(round(cost_unit)),
@@ -779,9 +619,8 @@ def solve_milp_ahp_word(
             lab_rows.append({
                 "analisis": k,
                 "muestras_L": int(solver.Value(L[k])),
-                "costo_unitario_COP_muestra": int(lab_cost[k]),
-                "factor_costo_campo_aplica_a_lab": 1.0,
                 "costo_COP": cost,
+                "factor_costo_campo_aplica_a_lab": 1.0,
                 "gamma_k": gamma[k] / W_SCALE,
                 "participacion_objetivo_lab": gamma[k] / W_SCALE,
                 "participacion_real_lab": cost / max(1, clab_val),
@@ -833,7 +672,6 @@ def solve_milp_ahp_word(
                 "Z2 laboratorio aprox COP": int(solver.Value(Z2_lab)) / W_SCALE,
                 "Uso presupuesto %": cused_val / max(1, budget),
                 "Presupuesto no usado": max(0, budget - cused_val),
-                "Número personas por equipo": float(n_personas_equipo),
                 "Factor costo campo": float(factor_costo_campo),
                 "Campo real %": cfield_val / max(1, cused_val),
                 "Lab real %": clab_val / max(1, cused_val),
@@ -908,14 +746,14 @@ def solve_milp_ahp_word(
 # -----------------------------
 
 st.title("🧪 Optimización MILP-AHP para estrategias de muestreo")
-st.caption("Versión basada en la formulación Word: turnos Día/Noche, sin mínimos, costo horario efectivo por equipo y AHP local protegido | factor solo campo. El piso de presupuesto queda desactivado por defecto.")
+st.caption("Versión basada en la formulación Word: turnos Día/Noche, sin mínimos, costos horarios directos del equipo, sin costos fijos ni prorrateo. Factor 1.1 aplicado solo a campo.")
 
 with st.sidebar:
     st.header("1) Datos")
     st.download_button(
         "📥 Descargar plantilla Excel estricta",
         data=build_template_excel_bytes(),
-        file_name="Data_template_MILP_AHP_v14_factor_solo_campo.xlsx",
+        file_name="Data_template_MILP_AHP_v15_costos_directos.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
         on_click="ignore",
@@ -926,20 +764,7 @@ with st.sidebar:
         uploaded = st.file_uploader("Carga tu Data.xlsx", type=["xlsx"])
 
     st.header("2) Solver")
-    time_limit = st.slider("Tiempo máximo por etapa (s)", min_value=3, max_value=180, value=30, step=1)
-    min_budget_pct = st.slider(
-        "Piso mínimo de presupuesto durante calibración AHP (%) — opcional",
-        min_value=0, max_value=100, value=0, step=1,
-        help=(
-            "Déjalo en 0 para seguir la secuencia lexicográfica del Word sin forzar gasto antes de ajustar AHP. "
-            "Si lo subes demasiado, el modelo puede usar actividades caras para alcanzar presupuesto y desajustar el AHP local."
-        ),
-    )
-    if min_budget_pct >= 80:
-        st.warning(
-            "Piso de presupuesto alto: puede forzar soluciones que gastan más, "
-            "pero desajustan la distribución local de campo/laboratorio. Úsalo solo para sensibilidad."
-        )
+    time_limit = st.slider("Tiempo máximo por etapa (s)", min_value=3, max_value=180, value=20, step=1)
 
 if data_mode == "Subir Excel":
     if uploaded is None:
@@ -967,14 +792,12 @@ with c3:
 with c4:
     max_teams = st.number_input("E_max: Equipos máximos por turno", value=int(_safe_float(params.get("E_max"), 2)), min_value=1, step=1)
 
-c5, c6, c7, c8 = st.columns(4)
+c5, c6, c7 = st.columns(3)
 with c5:
     beta_f = st.number_input("β_F: Peso global campo", value=float(_safe_float(params.get("beta_F"), 0.642)), min_value=0.0, max_value=1.0, step=0.0001, format="%.4f")
 with c6:
     beta_l = st.number_input("β_L: Peso global laboratorio", value=float(_safe_float(params.get("beta_L"), 0.358)), min_value=0.0, max_value=1.0, step=0.0001, format="%.4f")
 with c7:
-    n_people = st.number_input("Personas por equipo", value=float(_safe_float(params.get("n_personas_equipo"), 2)), min_value=1.0, step=1.0, format="%.0f")
-with c8:
     cost_factor = st.number_input("Factor costo campo", value=float(_safe_float(params.get("factor_costo_campo", params.get("factor_costo_total", 1.10)), 1.10)), min_value=0.0, step=0.01, format="%.2f")
 
 if abs((float(beta_f) + float(beta_l)) - 1.0) > 0.02:
@@ -999,7 +822,7 @@ with st.expander("S: Separaciones permitidas", expanded=False):
 left, right = st.columns(2)
 with left:
     st.markdown("### F: Actividades de campo")
-    st.caption("No hay mínimos y no se pregunta si produce muestra. La app calcula c_h efectivo = costo variable por persona × personas por equipo + costo fijo diario del equipo / horas de prorrateo. Luego multiplica SOLO el costo de campo por el factor de costo campo. Laboratorio mantiene su costo unitario fijo.")
+    st.caption("No hay mínimos, costos fijos ni prorrateo. Ingresa directamente el costo horario del equipo: Día = 1,500,000/9 ≈ 166,667 COP/h; Noche = 250,000 COP/h por defecto. El factor de costo se aplica solo a campo.")
     field_df = st.data_editor(
         parsed.field_df,
         num_rows="dynamic",
@@ -1008,10 +831,8 @@ with left:
             "alpha_f": st.column_config.NumberColumn("α_f", min_value=0.0, max_value=1.0, format="%.4f"),
             "t_Dia_h": st.column_config.NumberColumn("t_f,Día (h)", min_value=0, step=1),
             "t_Noche_h": st.column_config.NumberColumn("t_f,Noche (h)", min_value=0, step=1),
-            "c_var_Dia_COP_h_persona": st.column_config.NumberColumn("Costo variable Día COP/h/persona", min_value=0, step=1000),
-            "c_var_Noche_COP_h_persona": st.column_config.NumberColumn("Costo variable Noche COP/h/persona", min_value=0, step=1000),
-            "costo_fijo_diario_equipo_COP": st.column_config.NumberColumn("Costo fijo diario equipo COP/día", min_value=0, step=10_000),
-            "horas_prorrateo_fijo": st.column_config.NumberColumn("Horas prorrateo fijo", min_value=0.01, step=1),
+            "c_h_Dia_COP_h": st.column_config.NumberColumn("c_h,f,Día COP/h", min_value=0, step=10_000),
+            "c_h_Noche_COP_h": st.column_config.NumberColumn("c_h,f,Noche COP/h", min_value=0, step=10_000),
         },
     )
 with right:
@@ -1028,28 +849,12 @@ with right:
 
 # Diagnóstico de pesos locales
 try:
-    preview_circles, preview_sep, preview_field, preview_lab = clean_model_inputs(circles_df, separations_df, field_df, lab_df, n_personas_equipo=float(n_people))
+    preview_circles, preview_sep, preview_field, preview_lab = clean_model_inputs(circles_df, separations_df, field_df, lab_df)
     st.info(
         f"Suma β = {float(beta_f)+float(beta_l):.4f}; "
         f"suma α_f = {preview_field['alpha_f'].sum():.4f}; "
         f"suma γ_k = {preview_lab['gamma_k'].sum():.4f}."
     )
-    with st.expander("Ver cálculo del costo horario efectivo de campo", expanded=False):
-        cost_preview_cols = [
-            "actividad",
-            "c_var_Dia_COP_h_persona",
-            "c_var_Noche_COP_h_persona",
-            "n_personas_equipo",
-            "c_var_Dia_equipo_COP_h",
-            "c_var_Noche_equipo_COP_h",
-            "costo_fijo_diario_equipo_COP",
-            "horas_prorrateo_fijo",
-            "costo_fijo_COP_h",
-            "c_h_Dia_COP_h",
-            "c_h_Noche_COP_h",
-        ]
-        st.dataframe(preview_field[cost_preview_cols], use_container_width=True)
-        st.caption("Estos c_h efectivos son los parámetros que entran al MILP para calcular C_f.")
 except Exception as preview_exc:
     st.warning(f"Datos incompletos antes de resolver: {preview_exc}")
 
@@ -1057,7 +862,7 @@ run = st.button("🚀 Ejecutar optimización", type="primary", use_container_wid
 
 if run:
     try:
-        clean_circles, sep_list, clean_field, clean_lab = clean_model_inputs(circles_df, separations_df, field_df, lab_df, n_personas_equipo=float(n_people))
+        clean_circles, sep_list, clean_field, clean_lab = clean_model_inputs(circles_df, separations_df, field_df, lab_df)
         params_used = {
             "C_total": int(budget),
             "T_max": int(days),
@@ -1065,10 +870,8 @@ if run:
             "E_max": int(max_teams),
             "beta_F": float(beta_f),
             "beta_L": float(beta_l),
-            "n_personas_equipo": float(n_people),
             "factor_costo_campo": float(cost_factor),
             "separaciones": ", ".join(map(str, sep_list)),
-            "uso_minimo_presupuesto_calibracion": float(min_budget_pct) / 100.0,
         }
         with st.spinner("Resolviendo modelo lexicográfico según formulación Word..."):
             result = solve_milp_ahp_word(
@@ -1083,8 +886,6 @@ if run:
                 beta_field=float(beta_f),
                 beta_lab=float(beta_l),
                 time_limit_per_stage=int(time_limit),
-                min_budget_use_ratio=float(min_budget_pct) / 100.0,
-                n_personas_equipo=float(n_people),
                 factor_costo_campo=float(cost_factor),
             )
     except Exception as exc:
@@ -1170,7 +971,7 @@ if bundle is not None:
             st.download_button(
                 "Descargar reporte Excel multi-hoja",
                 data=excel_report,
-                file_name="reporte_muestreo_MILP_AHP_costo_equipo.xlsx",
+                file_name="reporte_muestreo_MILP_AHP_costos_directos.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
                 on_click="ignore",
@@ -1178,16 +979,6 @@ if bundle is not None:
     with tab2:
         st.dataframe(result["field"], use_container_width=True)
         if not result["field"].empty:
-            tmp_dev = result["field"].copy()
-            tmp_dev["desviacion_pp"] = (tmp_dev["participacion_real_campo"] - tmp_dev["alpha_f"]).abs()
-            max_dev = float(tmp_dev["desviacion_pp"].max())
-            if max_dev > 0.20:
-                st.warning(
-                    "La distribución local de campo está muy alejada del AHP. "
-                    "Esto suele ocurrir cuando se fuerza un piso alto de presupuesto o cuando, por costos/tiempos/geometría, "
-                    "la única forma factible de gastar más es usar una actividad cara como medición 24 h. "
-                    "Prueba bajar el piso mínimo de presupuesto o revisar costos/tiempos."
-                )
             field_plot = result["field"].melt(
                 id_vars="actividad",
                 value_vars=["alpha_f", "participacion_real_campo"],
@@ -1227,7 +1018,7 @@ else:
         """
         ### Flujo sugerido
         1. Descarga la plantilla estricta o usa **Ingresar manualmente**.
-        2. Define únicamente los parámetros del Word: conjuntos, tiempos por turno, pesos AHP y costo horario efectivo del equipo. La app puede calcularlo desde costo variable horario + costo fijo diario prorrateado.
+        2. Define únicamente los parámetros del Word: conjuntos, tiempos por turno, pesos AHP y costos horarios directos del equipo.
         3. Ejecuta la optimización.
         4. Descarga el reporte Excel multi-hoja; incluye una hoja `Modelo_usado` con las ecuaciones implementadas.
         """
