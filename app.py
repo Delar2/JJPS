@@ -55,8 +55,6 @@ PARAM_DEFAULTS = [
     {"Parametro": "E_max", "Descripcion": "Número máximo de equipos de trabajo disponibles por turno", "Unidad": "equipos", "Valor": 3},
     {"Parametro": "beta_F", "Descripcion": "Peso AHP de primer nivel del bloque campo", "Unidad": "proporcion", "Valor": 0.6420},
     {"Parametro": "beta_L", "Descripcion": "Peso AHP de primer nivel del bloque laboratorio", "Unidad": "proporcion", "Valor": 0.3580},
-    {"Parametro": "factor_costo_campo", "Descripcion": "Factor multiplicador aplicado solo al costo de campo calculado", "Unidad": "factor", "Valor": 1.10},
-    {"Parametro": "uso_minimo_presupuesto_AHP", "Descripcion": "Uso mínimo opcional del presupuesto durante calibración AHP; 0 lo desactiva", "Unidad": "proporcion", "Valor": 0.0},
     {"Parametro": "actividad_puntual_base", "Descripcion": "Nombre de la actividad base que usa separación por círculo", "Unidad": "texto", "Valor": "Muestreo puntual estándar"},
 ]
 
@@ -108,7 +106,7 @@ def build_template_excel_bytes() -> bytes:
         pd.DataFrame(DEFAULT_FIELD_ROWS).to_excel(writer, sheet_name="Campo", index=False)
         pd.DataFrame(DEFAULT_LAB_ROWS).to_excel(writer, sheet_name="Laboratorio", index=False)
         notes = pd.DataFrame([
-            {"Hoja": "Parametros", "Descripcion": "Incluye T_max, H_turno, C_total, E_max, beta_F, beta_L, factor_costo_campo, uso_minimo_presupuesto_AHP y actividad_puntual_base."},
+            {"Hoja": "Parametros", "Descripcion": "Incluye T_max, H_turno, C_total, E_max, beta_F, beta_L y actividad_puntual_base."},
             {"Hoja": "Circulos", "Descripcion": "Conjunto I. Columnas: ID, Perimetro_m."},
             {"Hoja": "Separaciones", "Descripcion": "Conjunto S. Columna: separacion_m. El modelo elige exactamente una separación por círculo para muestreo puntual."},
             {"Hoja": "Campo", "Descripcion": "Conjunto F. Una fila debe corresponder al muestreo puntual base. Las otras actividades son especializadas y cumplen Q_f <= Q_puntual."},
@@ -355,11 +353,10 @@ def model_equations_table() -> pd.DataFrame:
         ("Techo físico especializado", "Q_f <= Q_puntual para todo f != puntual"),
         ("Cotas mínimas campo", "Q_f >= 1 si alpha_f > 0"),
         ("Cotas mínimas laboratorio", "L_k >= 1 si gamma_k > 0"),
-        ("Costo campo", "C_f = factor_costo_campo * Q_f * sum_w c_h,f,w * t_f,w"),
+        ("Costo campo", "C_f = Q_f * sum_w c_h,f,w * t_f,w"),
         ("Costo lab", "C_k = c_lab,k * L_k"),
         ("Agregados", "C_field=sum_f C_f; C_lab=sum_k C_k; C_used=C_field+C_lab"),
         ("Presupuesto", "C_used <= C_total"),
-        ("Uso mínimo opcional", "C_used >= u_min*C_total, si se activa en la interfaz"),
         ("Capacidad", "sum_f t_f,w * Q_f <= E_w * T_max * H_turno  para todo w"),
         ("Equipos", "E_w <= E_max  para todo w"),
         ("Conservación", "sum_k L_k <= sum_f Q_f"),
@@ -438,8 +435,6 @@ def solve_milp_ahp_modified(
     beta_field: float,
     beta_lab: float,
     time_limit_per_stage: int,
-    factor_costo_campo: float = 1.0,
-    min_budget_use_ratio: float = 0.0,
     actividad_puntual_base=None,
 ) -> Dict:
     circles, separations, field_df, lab_df = clean_model_inputs(circles, pd.DataFrame({"separacion_m": separations}), field_df, lab_df)
@@ -457,9 +452,6 @@ def solve_milp_ahp_modified(
     perimeter = dict(zip(I, circles["Perimetro_m"].astype(float)))
 
     budget = int(round(budget_cop))
-    factor_costo_campo = max(0.0, float(factor_costo_campo))
-    factor_scale = 1000
-    factor_int = int(round(factor_costo_campo * factor_scale))
     beta = {"Campo": int(round(beta_field * W_SCALE)), "Laboratorio": int(round(beta_lab * W_SCALE))}
     alpha = {row["actividad"]: int(round(row["alpha_f"] * W_SCALE)) for _, row in field_df.iterrows()}
     gamma = {row["analisis"]: int(round(row["gamma_k"] * W_SCALE)) for _, row in lab_df.iterrows()}
@@ -512,7 +504,7 @@ def solve_milp_ahp_modified(
     # 4.3.1 Costos de campo
     for f in F:
         cost_per_unit_base = sum(c_h[(f, w)] * t[(f, w)] for w in W)
-        cost_per_unit = int(round(cost_per_unit_base * factor_int / factor_scale))
+        cost_per_unit = int(round(cost_per_unit_base))
         model.Add(Cf[f] == cost_per_unit * Q[f])
 
     # 4.3.2 Costos laboratorio
@@ -524,11 +516,6 @@ def solve_milp_ahp_modified(
     model.Add(Clab == sum(Ck[k] for k in K))
     model.Add(Cused == Cfield + Clab)
     model.Add(Cused <= budget)
-
-    # Uso mínimo opcional
-    min_budget_use_ratio = max(0.0, min(1.0, float(min_budget_use_ratio)))
-    if min_budget_use_ratio > 0:
-        model.Add(Cused >= int(round(budget * min_budget_use_ratio)))
 
     # 4.2.2 Capacidad operativa por turno
     for w in W:
@@ -594,7 +581,7 @@ def solve_milp_ahp_modified(
             night_h = int(t[(f, "Noche")] * q)
             cost = int(solver.Value(Cf[f]))
             cost_unit_base = sum(c_h[(f, w)] * t[(f, w)] for w in W)
-            cost_unit = int(round(cost_unit_base * factor_int / factor_scale))
+            cost_unit = int(round(cost_unit_base))
             field_rows.append({
                 "actividad": f,
                 "tipo": "puntual_base" if f == puntual else "especializado",
@@ -606,7 +593,6 @@ def solve_milp_ahp_modified(
                 "c_h_Dia_COP_h": c_h[(f, "Dia")],
                 "c_h_Noche_COP_h": c_h[(f, "Noche")],
                 "costo_unitario_base_COP": int(round(cost_unit_base)),
-                "factor_costo_campo": factor_costo_campo,
                 "costo_unitario_campo_COP": int(round(cost_unit)),
                 "costo_COP": cost,
                 "alpha_f": alpha[f] / W_SCALE,
@@ -642,7 +628,7 @@ def solve_milp_ahp_modified(
                     chosen_points = int(n[(i, s)])
                     break
             cost_base = chosen_points * sum(c_h[(puntual, w)] * t[(puntual, w)] for w in W)
-            cost = int(round(cost_base * factor_int / factor_scale))
+            cost = int(round(cost_base))
             day_h = chosen_points * t[(puntual, "Dia")]
             night_h = chosen_points * t[(puntual, "Noche")]
             punctual_by_circle.append((i, chosen_points))
@@ -669,7 +655,7 @@ def solve_milp_ahp_modified(
                 if int(pts) <= 0:
                     continue
                 cost_base = int(pts) * sum(c_h[(f, w)] * t[(f, w)] for w in W)
-                cost = int(round(cost_base * factor_int / factor_scale))
+                cost = int(round(cost_base))
                 day_h = int(pts) * t[(f, "Dia")]
                 night_h = int(pts) * t[(f, "Noche")]
                 plan_rows.append({
@@ -710,7 +696,6 @@ def solve_milp_ahp_modified(
                 "Z2 laboratorio aprox COP": int(solver.Value(Z2_lab)) / W_SCALE,
                 "Uso presupuesto %": cused_val / max(1, budget),
                 "Presupuesto no usado": max(0, budget - cused_val),
-                "Factor costo campo": float(factor_costo_campo),
                 "Campo real %": cfield_val / max(1, cused_val),
                 "Lab real %": clab_val / max(1, cused_val),
                 "Campo objetivo AHP %": beta["Campo"] / W_SCALE,
@@ -770,14 +755,14 @@ def solve_milp_ahp_modified(
 # -----------------------------
 
 st.title("🧪 Optimización MILP-AHP para estrategias de muestreo")
-st.caption("Versión modificada: separación única por círculo para muestreo puntual, techo físico para muestreos especializados y cotas mínimas por AHP > 0.")
+st.caption("Versión final: separación única por círculo, techo físico para muestreos especializados y cotas mínimas por AHP > 0.")
 
 with st.sidebar:
     st.header("1) Datos")
     st.download_button(
-        "📥 Descargar plantilla Excel modificada",
+        "📥 Descargar plantilla Excel FINAL",
         data=build_template_excel_bytes(),
-        file_name="Data_template_MILP_AHP_v17_modificado.xlsx",
+        file_name="Data_template_MILP_AHP_FINAL.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
         on_click="ignore",
@@ -789,12 +774,6 @@ with st.sidebar:
 
     st.header("2) Solver")
     time_limit = st.slider("Tiempo máximo por etapa (s)", min_value=3, max_value=180, value=20, step=1)
-    min_budget_pct = st.slider(
-        "Uso mínimo de presupuesto para calibrar AHP (%)",
-        min_value=0, max_value=100, value=0, step=1,
-        help=("Opcional. Si es mayor que 0, obliga a que las etapas AHP usen al menos ese porcentaje del presupuesto."),
-    )
-
 if data_mode == "Subir Excel":
     if uploaded is None:
         st.info("Carga un Excel con la plantilla modificada o usa el modo manual.")
@@ -821,13 +800,11 @@ with c3:
 with c4:
     max_teams = st.number_input("E_max: Equipos máximos por turno", value=int(_safe_float(params.get("E_max"), 3)), min_value=1, step=1)
 
-c5, c6, c7 = st.columns(3)
+c5, c6 = st.columns(2)
 with c5:
     beta_f = st.number_input("β_F: Peso global campo", value=float(_safe_float(params.get("beta_F"), 0.642)), min_value=0.0, max_value=1.0, step=0.0001, format="%.4f")
 with c6:
     beta_l = st.number_input("β_L: Peso global laboratorio", value=float(_safe_float(params.get("beta_L"), 0.358)), min_value=0.0, max_value=1.0, step=0.0001, format="%.4f")
-with c7:
-    cost_factor = st.number_input("Factor costo campo", value=float(_safe_float(params.get("factor_costo_campo"), 1.10)), min_value=0.0, step=0.01, format="%.2f")
 
 if abs((float(beta_f) + float(beta_l)) - 1.0) > 0.02:
     st.warning(f"β_F + β_L debería sumar 1. Suma actual: {float(beta_f)+float(beta_l):.4f}.")
@@ -902,8 +879,6 @@ if run:
             "E_max": int(max_teams),
             "beta_F": float(beta_f),
             "beta_L": float(beta_l),
-            "factor_costo_campo": float(cost_factor),
-            "uso_minimo_presupuesto_AHP": float(min_budget_pct) / 100.0,
             "actividad_puntual_base": find_puntual_activity(clean_field, actividad_base),
             "separaciones": ", ".join(map(str, sep_list)),
         }
@@ -920,8 +895,6 @@ if run:
                 beta_field=float(beta_f),
                 beta_lab=float(beta_l),
                 time_limit_per_stage=int(time_limit),
-                factor_costo_campo=float(cost_factor),
-                min_budget_use_ratio=float(min_budget_pct) / 100.0,
                 actividad_puntual_base=actividad_base,
             )
     except Exception as exc:
