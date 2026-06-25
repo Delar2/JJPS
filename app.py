@@ -9,7 +9,7 @@ import streamlit as st
 from ortools.sat.python import cp_model
 
 st.set_page_config(
-    page_title="MILP-AHP | Saturación operativa",
+    page_title="MILP-AHP | Radio/transecto y saturación operativa",
     page_icon="🧪",
     layout="wide",
 )
@@ -22,7 +22,7 @@ if "last_solution_bundle" not in st.session_state:
 # =========================================================
 # Cambios principales respecto a la versión anterior:
 # - La separación se elige una sola vez por círculo y aplica al muestreo puntual base.
-# - Q_puntual se calcula desde perímetros y separaciones.
+# - Q_puntual se calcula desde radios/transectos radiales y separaciones.
 # - Los muestreos especializados (24h, largo/extendido, multinivel) son cantidades
 #   totales y no pueden superar Q_puntual.
 # - Se agregan cotas mínimas: cualquier técnica/análisis con peso AHP > 0 debe tener
@@ -63,9 +63,9 @@ PARAM_DEFAULTS = [
 ]
 
 DEFAULT_CIRCLES = [
-    {"ID": "C1", "Perimetro_m": 113.0},
-    {"ID": "C2", "Perimetro_m": 164.0},
-    {"ID": "C3", "Perimetro_m": 702.0},
+    {"ID": "C1", "Radio_m": 113.0},
+    {"ID": "C2", "Radio_m": 164.0},
+    {"ID": "C3", "Radio_m": 702.0},
 ]
 
 DEFAULT_SEPARATIONS = [
@@ -111,7 +111,7 @@ def build_template_excel_bytes() -> bytes:
         pd.DataFrame(DEFAULT_LAB_ROWS).to_excel(writer, sheet_name="Laboratorio", index=False)
         notes = pd.DataFrame([
             {"Hoja": "Parametros", "Descripcion": "Incluye T_max, H_turno, C_total, E_max, beta_F, beta_L, N_min, N_max y actividad_puntual_base."},
-            {"Hoja": "Circulos", "Descripcion": "Conjunto I. Columnas: ID, Perimetro_m."},
+            {"Hoja": "Circulos", "Descripcion": "Conjunto I. Columnas: ID, Radio_m. Radio_m representa el radio del círculo o la longitud del transecto radial."},
             {"Hoja": "Separaciones", "Descripcion": "Conjunto S. Columna: separacion_m. El modelo elige exactamente una separación por círculo para muestreo puntual."},
             {"Hoja": "Campo", "Descripcion": "Conjunto F. Una fila debe corresponder al muestreo puntual base. Las otras actividades son especializadas y cumplen Q_f <= Q_puntual."},
             {"Hoja": "Laboratorio", "Descripcion": "Conjunto K. Si gamma_k > 0, el modelo fuerza L_k >= 1."},
@@ -171,7 +171,7 @@ def parse_excel(file_obj) -> ParsedData:
 
     circles = xls.parse(sheet_map["circulos"])
     circles = circles.iloc[:, :2].copy()
-    circles.columns = ["ID", "Perimetro_m"]
+    circles.columns = ["ID", "Radio_m"]
 
     separations = xls.parse(sheet_map["separaciones"])
     separations = separations.iloc[:, :1].copy()
@@ -203,11 +203,14 @@ def clean_model_inputs(
     field_df = field_df.copy()
     lab_df = lab_df.copy()
 
-    if "ID" not in circles.columns or "Perimetro_m" not in circles.columns:
-        raise ValueError("La tabla de círculos debe contener ID y Perimetro_m.")
+    # Compatibilidad: plantillas antiguas podían usar Perimetro_m.
+    if "Radio_m" not in circles.columns and "Perimetro_m" in circles.columns:
+        circles = circles.rename(columns={"Perimetro_m": "Radio_m"})
+    if "ID" not in circles.columns or "Radio_m" not in circles.columns:
+        raise ValueError("La tabla de círculos debe contener ID y Radio_m.")
     circles["ID"] = _clean_name_series(circles["ID"])
-    circles["Perimetro_m"] = pd.to_numeric(circles["Perimetro_m"], errors="coerce")
-    circles = circles[(circles["ID"] != "") & circles["Perimetro_m"].notna() & (circles["Perimetro_m"] > 0)]
+    circles["Radio_m"] = pd.to_numeric(circles["Radio_m"], errors="coerce")
+    circles = circles[(circles["ID"] != "") & circles["Radio_m"].notna() & (circles["Radio_m"] > 0)]
     circles = circles.drop_duplicates(subset=["ID"], keep="first").reset_index(drop=True)
 
     if "separacion_m" not in separations.columns:
@@ -255,12 +258,17 @@ def validate_weight_sum(name: str, value: float, tolerance: float = 0.02):
         raise ValueError(f"Según la formulación, {name} debe sumar 1. Valor actual: {value:.4f}.")
 
 
-def compute_n_points(perimeter: float, separation: int) -> int:
+def compute_n_points(radius: float, separation: int) -> int:
+    """Calcula n_i,s según el modelo final: max(1, floor(R_i / s) + 1).
+
+    R_i representa el radio del círculo de hadas o la longitud del transecto radial.
+    El +1 cuenta ambos extremos del transecto cuando se discretiza con separación s.
+    """
     if separation <= 0:
         raise ValueError("Todas las separaciones deben ser mayores que cero.")
-    if not math.isfinite(float(perimeter)) or perimeter <= 0:
-        raise ValueError(f"Perímetro inválido: {perimeter}.")
-    return max(1, int(math.floor(float(perimeter) / int(separation))))
+    if not math.isfinite(float(radius)) or radius <= 0:
+        raise ValueError(f"Radio/transecto radial inválido: {radius}.")
+    return max(1, int(math.floor(float(radius) / int(separation))) + 1)
 
 
 def find_puntual_activity(field_df: pd.DataFrame, preferred_name=None) -> str:
@@ -317,7 +325,7 @@ def build_lab_allocation_by_circle(plan_df: pd.DataFrame, lab_result_df: pd.Data
         base_plan = plan_df[plan_df["circulo"].astype(str) != "GLOBAL"].copy()
     if base_plan.empty:
         return pd.DataFrame(), pd.DataFrame()
-    all_circles = base_plan[["circulo", "perimetro_m"]].drop_duplicates().sort_values("circulo").reset_index(drop=True)
+    all_circles = base_plan[["circulo", "radio_m"]].drop_duplicates().sort_values("circulo").reset_index(drop=True)
     capacity = base_plan.groupby("circulo", as_index=True)["puntos"].sum().rename("muestras_puntuales_base")
     wide = all_circles.merge(capacity, left_on="circulo", right_index=True, how="left")
     wide["muestras_puntuales_base"] = pd.to_numeric(wide["muestras_puntuales_base"], errors="coerce").fillna(0).astype(int)
@@ -334,13 +342,13 @@ def build_lab_allocation_by_circle(plan_df: pd.DataFrame, lab_result_df: pd.Data
         for idx, alloc in allocation.items():
             long_rows.append({
                 "circulo": wide.loc[idx, "circulo"],
-                "perimetro_m": wide.loc[idx, "perimetro_m"],
+                "radio_m": wide.loc[idx, "radio_m"],
                 "muestras_puntuales_base": int(wide.loc[idx, "muestras_puntuales_base"]),
                 "analisis": analysis,
                 "muestras_asignadas_sugeridas": int(alloc),
                 "costo_estimado_COP": int(round(int(alloc) * cost_per_sample)),
             })
-    lab_cols = [c for c in wide.columns if c not in ["circulo", "perimetro_m", "muestras_puntuales_base"]]
+    lab_cols = [c for c in wide.columns if c not in ["circulo", "radio_m", "muestras_puntuales_base"]]
     wide["analisis_totales_asignados"] = wide[lab_cols].sum(axis=1) if lab_cols else 0
     long_df = pd.DataFrame(long_rows)
     if not long_df.empty:
@@ -351,7 +359,7 @@ def build_lab_allocation_by_circle(plan_df: pd.DataFrame, lab_result_df: pd.Data
 def model_equations_table() -> pd.DataFrame:
     rows = [
         ("Conjuntos", "I, S, F, K, W={Dia,Noche}; F = {Puntual, 24h, Largo, Multinivel}"),
-        ("Puntos puntuales", "n_i,s = max(1, floor(P_i / s))"),
+        ("Puntos puntuales", "n_i,s = max(1, floor(R_i / s) + 1)"),
         ("Selección única por círculo", "sum_s y_i,s = 1  para todo i"),
         ("Muestras puntuales", "Q_puntual = sum_i sum_s n_i,s * y_i,s"),
         ("Saturación operativa por círculo", "N_min <= sum_s n_i,s * y_i,s <= N_max  para todo i"),
@@ -462,7 +470,7 @@ def solve_milp_ahp_modified(
     W = SHIFTS
     puntual = find_puntual_activity(field_df, actividad_puntual_base)
     specialized = [f for f in F if f != puntual]
-    perimeter = dict(zip(I, circles["Perimetro_m"].astype(float)))
+    radius = dict(zip(I, circles["Radio_m"].astype(float)))
 
     budget = int(round(budget_cop))
     beta = {"Campo": int(round(beta_field * W_SCALE)), "Laboratorio": int(round(beta_lab * W_SCALE))}
@@ -477,7 +485,7 @@ def solve_milp_ahp_modified(
         c_h[(f, "Dia")] = int(round(float(row["c_h_Dia_COP_h"])))
         c_h[(f, "Noche")] = int(round(float(row["c_h_Noche_COP_h"])))
     lab_cost = dict(zip(K, lab_df["c_lab_COP_muestra"].round().astype(int)))
-    n = {(i, s): compute_n_points(perimeter[i], s) for i in I for s in separations}
+    n = {(i, s): compute_n_points(radius[i], s) for i in I for s in separations}
 
     infeasible_saturation = []
     for i in I:
@@ -485,7 +493,7 @@ def solve_milp_ahp_modified(
         if not feasible_s:
             infeasible_saturation.append({
                 "circulo": i,
-                "perimetro_m": perimeter[i],
+                "radio_m": radius[i],
                 "puntos_por_separacion": ", ".join(f"{s} m: {n[(i, s)]}" for s in separations),
                 "N_min": n_min,
                 "N_max": n_max,
@@ -673,7 +681,7 @@ def solve_milp_ahp_modified(
             punctual_by_circle.append((i, chosen_points))
             plan_rows.append({
                 "circulo": i,
-                "perimetro_m": perimeter[i],
+                "radio_m": radius[i],
                 "actividad": puntual,
                 "tipo_resultado": "puntual_por_circulo",
                 "separacion_m": chosen_s,
@@ -702,7 +710,7 @@ def solve_milp_ahp_modified(
                 night_h = int(pts) * t[(f, "Noche")]
                 plan_rows.append({
                     "circulo": i,
-                    "perimetro_m": perimeter[i],
+                    "radio_m": radius[i],
                     "actividad": f,
                     "tipo_resultado": "especializado_sugerido_por_circulo",
                     "separacion_m": "no aplica",
@@ -796,7 +804,7 @@ def solve_milp_ahp_modified(
 # -----------------------------
 
 st.title("🧪 Optimización MILP-AHP para estrategias de muestreo")
-st.caption("Versión final: separación única por círculo, saturación operativa N_min/N_max, techo físico para muestreos especializados y cotas mínimas por AHP > 0.")
+st.caption("Versión final: separación única por círculo, R_i como radio/transecto radial, n_i,s = max(1, floor(R_i/s)+1), saturación N_min/N_max, techo físico y cotas mínimas por AHP > 0.")
 
 with st.sidebar:
     st.header("1) Datos")
@@ -860,12 +868,12 @@ if abs((float(beta_f) + float(beta_l)) - 1.0) > 0.02:
     st.warning(f"β_F + β_L debería sumar 1. Suma actual: {float(beta_f)+float(beta_l):.4f}.")
 
 st.subheader("Conjuntos definidos por el usuario")
-with st.expander("I: Círculos de hadas / perímetros", expanded=False):
+with st.expander("I: Círculos de hadas / radio o transecto radial", expanded=False):
     circles_df = st.data_editor(
         parsed.circles,
         num_rows="dynamic",
         use_container_width=True,
-        column_config={"Perimetro_m": st.column_config.NumberColumn("P_i: Perímetro (m)", min_value=0.01)},
+        column_config={"Radio_m": st.column_config.NumberColumn("R_i: Radio / longitud del transecto radial (m)", min_value=0.01)},
     )
 with st.expander("S: Separaciones permitidas", expanded=False):
     separations_df = st.data_editor(
@@ -915,12 +923,12 @@ try:
     )
     sat_rows = []
     for _, r in preview_circles.iterrows():
-        vals = [compute_n_points(float(r['Perimetro_m']), int(s)) for s in preview_sep]
+        vals = [compute_n_points(float(r['Radio_m']), int(s)) for s in preview_sep]
         feasible = [int(s) for s, pts in zip(preview_sep, vals) if int(n_min_input) <= pts <= int(n_max_input)]
         if not feasible:
             sat_rows.append({
                 "circulo": r["ID"],
-                "perimetro_m": float(r["Perimetro_m"]),
+                "radio_m": float(r["Radio_m"]),
                 "puntos_por_separacion": ", ".join(f"{int(s)} m: {pts}" for s, pts in zip(preview_sep, vals)),
                 "N_min": int(n_min_input),
                 "N_max": int(n_max_input),
