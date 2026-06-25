@@ -9,7 +9,7 @@ import streamlit as st
 from ortools.sat.python import cp_model
 
 st.set_page_config(
-    page_title="MILP-AHP | Modelo modificado",
+    page_title="MILP-AHP | Saturación operativa",
     page_icon="🧪",
     layout="wide",
 )
@@ -27,6 +27,7 @@ if "last_solution_bundle" not in st.session_state:
 #   totales y no pueden superar Q_puntual.
 # - Se agregan cotas mínimas: cualquier técnica/análisis con peso AHP > 0 debe tener
 #   al menos 1 unidad.
+# - Se agrega saturación operativa por círculo: N_min <= puntos_i <= N_max.
 # - Se mantienen presupuesto, capacidad por turno, conservación de muestras y AHP.
 # =========================================================
 
@@ -37,6 +38,8 @@ TARGET_BUDGET_USE = 0.995
 DEFAULT_MIN_BUDGET_USE = 0.0
 DEFAULT_COSTO_DIA_COP_H = int(round(1_500_000 / 9))
 DEFAULT_COSTO_NOCHE_COP_H = 250_000
+DEFAULT_N_MIN = 1
+DEFAULT_N_MAX = 999999
 
 
 @dataclass
@@ -55,6 +58,8 @@ PARAM_DEFAULTS = [
     {"Parametro": "E_max", "Descripcion": "Número máximo de equipos de trabajo disponibles por turno", "Unidad": "equipos", "Valor": 3},
     {"Parametro": "beta_F", "Descripcion": "Peso AHP de primer nivel del bloque campo", "Unidad": "proporcion", "Valor": 0.6420},
     {"Parametro": "beta_L", "Descripcion": "Peso AHP de primer nivel del bloque laboratorio", "Unidad": "proporcion", "Valor": 0.3580},
+    {"Parametro": "N_min", "Descripcion": "Número mínimo de puntos puntuales requeridos por círculo", "Unidad": "puntos/círculo", "Valor": DEFAULT_N_MIN},
+    {"Parametro": "N_max", "Descripcion": "Número máximo de puntos puntuales permitidos por círculo", "Unidad": "puntos/círculo", "Valor": DEFAULT_N_MAX},
     {"Parametro": "actividad_puntual_base", "Descripcion": "Nombre de la actividad base que usa separación por círculo", "Unidad": "texto", "Valor": "Muestreo puntual estándar"},
 ]
 
@@ -106,12 +111,12 @@ def build_template_excel_bytes() -> bytes:
         pd.DataFrame(DEFAULT_FIELD_ROWS).to_excel(writer, sheet_name="Campo", index=False)
         pd.DataFrame(DEFAULT_LAB_ROWS).to_excel(writer, sheet_name="Laboratorio", index=False)
         notes = pd.DataFrame([
-            {"Hoja": "Parametros", "Descripcion": "Incluye T_max, H_turno, C_total, E_max, beta_F, beta_L y actividad_puntual_base."},
+            {"Hoja": "Parametros", "Descripcion": "Incluye T_max, H_turno, C_total, E_max, beta_F, beta_L, N_min, N_max y actividad_puntual_base."},
             {"Hoja": "Circulos", "Descripcion": "Conjunto I. Columnas: ID, Perimetro_m."},
             {"Hoja": "Separaciones", "Descripcion": "Conjunto S. Columna: separacion_m. El modelo elige exactamente una separación por círculo para muestreo puntual."},
             {"Hoja": "Campo", "Descripcion": "Conjunto F. Una fila debe corresponder al muestreo puntual base. Las otras actividades son especializadas y cumplen Q_f <= Q_puntual."},
             {"Hoja": "Laboratorio", "Descripcion": "Conjunto K. Si gamma_k > 0, el modelo fuerza L_k >= 1."},
-            {"Hoja": "Modelo", "Descripcion": "Cotas mínimas: si alpha_f > 0 entonces Q_f >= 1; si gamma_k > 0 entonces L_k >= 1. Conservación: sum_k L_k <= sum_f Q_f."},
+            {"Hoja": "Modelo", "Descripcion": "Saturación operativa: N_min <= puntos_i <= N_max. Cotas mínimas: si alpha_f > 0 entonces Q_f >= 1; si gamma_k > 0 entonces L_k >= 1. Conservación: sum_k L_k <= sum_f Q_f."},
         ])
         notes.to_excel(writer, sheet_name="Notas_formato", index=False)
         for ws in writer.book.worksheets:
@@ -350,6 +355,7 @@ def model_equations_table() -> pd.DataFrame:
         ("Puntos puntuales", "n_i,s = max(1, floor(P_i / s))"),
         ("Selección única por círculo", "sum_s y_i,s = 1  para todo i"),
         ("Muestras puntuales", "Q_puntual = sum_i sum_s n_i,s * y_i,s"),
+        ("Saturación operativa por círculo", "N_min <= sum_s n_i,s * y_i,s <= N_max  para todo i"),
         ("Techo físico especializado", "Q_f <= Q_puntual para todo f != puntual"),
         ("Cotas mínimas campo", "Q_f >= 1 si alpha_f > 0"),
         ("Cotas mínimas laboratorio", "L_k >= 1 si gamma_k > 0"),
@@ -436,8 +442,16 @@ def solve_milp_ahp_modified(
     beta_lab: float,
     time_limit_per_stage: int,
     actividad_puntual_base=None,
+    n_min: int = DEFAULT_N_MIN,
+    n_max: int = DEFAULT_N_MAX,
 ) -> Dict:
     circles, separations, field_df, lab_df = clean_model_inputs(circles, pd.DataFrame({"separacion_m": separations}), field_df, lab_df)
+    n_min = int(round(float(n_min)))
+    n_max = int(round(float(n_max)))
+    if n_min < 1:
+        raise ValueError("N_min debe ser mayor o igual a 1.")
+    if n_max < n_min:
+        raise ValueError("N_max debe ser mayor o igual a N_min.")
 
     validate_weight_sum("beta_F + beta_L", beta_field + beta_lab)
     validate_weight_sum("sum_f alpha_f", float(field_df["alpha_f"].sum()))
@@ -466,7 +480,26 @@ def solve_milp_ahp_modified(
     lab_cost = dict(zip(K, lab_df["c_lab_COP_muestra"].round().astype(int)))
     n = {(i, s): compute_n_points(perimeter[i], s) for i in I for s in separations}
 
-    max_puntual = sum(max(n[(i, s)] for s in separations) for i in I)
+    infeasible_saturation = []
+    for i in I:
+        feasible_s = [s for s in separations if n_min <= n[(i, s)] <= n_max]
+        if not feasible_s:
+            infeasible_saturation.append({
+                "circulo": i,
+                "perimetro_m": perimeter[i],
+                "puntos_por_separacion": ", ".join(f"{s} m: {n[(i, s)]}" for s in separations),
+                "N_min": n_min,
+                "N_max": n_max,
+            })
+    if infeasible_saturation:
+        return {
+            "ok": False,
+            "logs": [{"etapa": "Prevalidación saturación operativa", "estado": "INFEASIBLE"}],
+            "error": "No se encontró solución factible: al menos un círculo no tiene ninguna separación que cumpla N_min <= puntos_i <= N_max.",
+            "diagnostico_saturacion": pd.DataFrame(infeasible_saturation),
+        }
+
+    max_puntual = sum(max(n[(i, s)] for s in separations if n_min <= n[(i, s)] <= n_max) for i in I)
     model = cp_model.CpModel()
 
     y = {(i, s): model.NewBoolVar(f"y_sep__{i}__{s}") for i in I for s in separations}
@@ -485,6 +518,13 @@ def solve_milp_ahp_modified(
     # 4.1.1 Selección única por círculo para muestreo puntual
     for i in I:
         model.Add(sum(y[(i, s)] for s in separations) == 1)
+
+    # 4.1.3 Restricción de saturación operativa por círculo
+    # Impide sub-muestreo y sobre-muestreo en cada círculo.
+    for i in I:
+        points_i = sum(n[(i, s)] * y[(i, s)] for s in separations)
+        model.Add(points_i >= n_min)
+        model.Add(points_i <= n_max)
 
     # 4.1.2 Cantidad total de muestras puntuales
     model.Add(Q[puntual] == sum(n[(i, s)] * y[(i, s)] for i in I for s in separations))
@@ -639,6 +679,9 @@ def solve_milp_ahp_modified(
                 "tipo_resultado": "puntual_por_circulo",
                 "separacion_m": chosen_s,
                 "puntos": chosen_points,
+                "N_min": n_min,
+                "N_max": n_max,
+                "cumple_saturacion": bool(n_min <= chosen_points <= n_max),
                 "tiempo_dia_h": day_h,
                 "tiempo_noche_h": night_h,
                 "tiempo_total_h": day_h + night_h,
@@ -665,6 +708,9 @@ def solve_milp_ahp_modified(
                     "tipo_resultado": "especializado_sugerido_por_circulo",
                     "separacion_m": "no aplica",
                     "puntos": int(pts),
+                    "N_min": "no aplica",
+                    "N_max": "no aplica",
+                    "cumple_saturacion": "no aplica",
                     "tiempo_dia_h": day_h,
                     "tiempo_noche_h": night_h,
                     "tiempo_total_h": day_h + night_h,
@@ -684,6 +730,8 @@ def solve_milp_ahp_modified(
                 "Gasto laboratorio": clab_val,
                 "Actividad puntual base": puntual,
                 "Muestras puntuales base": int(solver.Value(Q[puntual])),
+                "N_min puntos/círculo": n_min,
+                "N_max puntos/círculo": n_max,
                 "Equipos dia": int(solver.Value(E["Dia"])),
                 "Equipos noche": int(solver.Value(E["Noche"])),
                 "Tiempo campo dia h": total_time_by_shift["Dia"],
@@ -741,9 +789,12 @@ def solve_milp_ahp_modified(
         return {"ok": True, **best_solution}
     final_solution = extract("Etapa 3", status3)
     final_solution["logs"] = logs
-    # No se muestra advertencia si el presupuesto usado no alcanza 99.5 %.
-    # La etapa 3 ya maximiza C_used bajo las restricciones del modelo;
-    # por tanto, la solución sigue siendo válida aunque quede presupuesto sin usar.
+    if final_solution["kpis"]["Uso presupuesto %"] < TARGET_BUDGET_USE:
+        final_solution["warning"] = (
+            "La etapa 3 maximizó el presupuesto usado, pero no alcanzó 99.5 %. "
+            "Con los datos actuales, el presupuesto restante no puede gastarse sin romper alguna restricción activa: "
+            "techo físico Q_f <= Q_puntual, capacidad por turnos, conservación de muestras, costos discretos o coherencia AHP preservada."
+        )
     return {"ok": True, **final_solution}
 
 
@@ -752,7 +803,7 @@ def solve_milp_ahp_modified(
 # -----------------------------
 
 st.title("🧪 Optimización MILP-AHP para estrategias de muestreo")
-st.caption("Versión final: separación única por círculo, techo físico para muestreos especializados y cotas mínimas por AHP > 0.")
+st.caption("Versión final: separación única por círculo, saturación operativa N_min/N_max, techo físico para muestreos especializados y cotas mínimas por AHP > 0.")
 
 with st.sidebar:
     st.header("1) Datos")
@@ -802,6 +853,15 @@ with c5:
     beta_f = st.number_input("β_F: Peso global campo", value=float(_safe_float(params.get("beta_F"), 0.642)), min_value=0.0, max_value=1.0, step=0.0001, format="%.4f")
 with c6:
     beta_l = st.number_input("β_L: Peso global laboratorio", value=float(_safe_float(params.get("beta_L"), 0.358)), min_value=0.0, max_value=1.0, step=0.0001, format="%.4f")
+
+c7, c8 = st.columns(2)
+with c7:
+    n_min_input = st.number_input("N_min: Puntos mínimos por círculo", value=int(_safe_float(params.get("N_min"), DEFAULT_N_MIN)), min_value=1, step=1)
+with c8:
+    n_max_input = st.number_input("N_max: Puntos máximos por círculo", value=int(_safe_float(params.get("N_max"), DEFAULT_N_MAX)), min_value=1, step=1)
+
+if int(n_max_input) < int(n_min_input):
+    st.error("N_max debe ser mayor o igual a N_min.")
 
 if abs((float(beta_f) + float(beta_l)) - 1.0) > 0.02:
     st.warning(f"β_F + β_L debería sumar 1. Suma actual: {float(beta_f)+float(beta_l):.4f}.")
@@ -860,6 +920,21 @@ try:
         f"suma α_f = {preview_field['alpha_f'].sum():.4f}; "
         f"suma γ_k = {preview_lab['gamma_k'].sum():.4f}."
     )
+    sat_rows = []
+    for _, r in preview_circles.iterrows():
+        vals = [compute_n_points(float(r['Perimetro_m']), int(s)) for s in preview_sep]
+        feasible = [int(s) for s, pts in zip(preview_sep, vals) if int(n_min_input) <= pts <= int(n_max_input)]
+        if not feasible:
+            sat_rows.append({
+                "circulo": r["ID"],
+                "perimetro_m": float(r["Perimetro_m"]),
+                "puntos_por_separacion": ", ".join(f"{int(s)} m: {pts}" for s, pts in zip(preview_sep, vals)),
+                "N_min": int(n_min_input),
+                "N_max": int(n_max_input),
+            })
+    if sat_rows:
+        st.error("Hay círculos sin separación factible con el N_min/N_max actual. Ajusta N_min, N_max o las separaciones.")
+        st.dataframe(pd.DataFrame(sat_rows), use_container_width=True)
 except Exception as preview_exc:
     st.warning(f"Datos incompletos antes de resolver: {preview_exc}")
 
@@ -876,6 +951,8 @@ if run:
             "E_max": int(max_teams),
             "beta_F": float(beta_f),
             "beta_L": float(beta_l),
+            "N_min": int(n_min_input),
+            "N_max": int(n_max_input),
             "actividad_puntual_base": find_puntual_activity(clean_field, actividad_base),
             "separaciones": ", ".join(map(str, sep_list)),
         }
@@ -893,6 +970,8 @@ if run:
                 beta_lab=float(beta_l),
                 time_limit_per_stage=int(time_limit),
                 actividad_puntual_base=actividad_base,
+                n_min=int(n_min_input),
+                n_max=int(n_max_input),
             )
     except Exception as exc:
         st.session_state.last_solution_bundle = None
@@ -903,6 +982,9 @@ if run:
         st.session_state.last_solution_bundle = None
         st.error(result.get("error", "No se encontró solución."))
         st.dataframe(pd.DataFrame(result.get("logs", [])), use_container_width=True)
+        if "diagnostico_saturacion" in result:
+            st.markdown("### Diagnóstico de saturación operativa")
+            st.dataframe(result["diagnostico_saturacion"], use_container_width=True)
         st.stop()
 
     excel_report = build_excel_report(result, clean_lab, params_used)
@@ -957,7 +1039,7 @@ if bundle is not None:
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["Plan", "Campo", "Laboratorio", "Modelo usado", "Log solver"])
     with tab1:
-        st.caption("El muestreo puntual por círculo es decisión directa del solver. Las actividades especializadas por círculo son una distribución sugerida de las cantidades globales Q_f.")
+        st.caption("El muestreo puntual por círculo es decisión directa del solver y debe cumplir N_min ≤ puntos_i ≤ N_max. Las actividades especializadas por círculo son una distribución sugerida de las cantidades globales Q_f.")
         st.dataframe(result["plan"], use_container_width=True)
         c_csv, c_xlsx = st.columns(2)
         with c_csv:
@@ -1002,7 +1084,7 @@ else:
         """
         ### Flujo sugerido
         1. Descarga la plantilla modificada o usa **Ingresar manualmente**.
-        2. Define círculos, separaciones, actividades de campo y análisis de laboratorio.
+        2. Define círculos, separaciones, N_min/N_max, actividades de campo y análisis de laboratorio.
         3. Ejecuta la optimización.
         4. Descarga el reporte Excel multi-hoja; incluye `Modelo_usado` con las ecuaciones implementadas.
         """
