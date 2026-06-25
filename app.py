@@ -34,7 +34,6 @@ if "last_solution_bundle" not in st.session_state:
 SHIFTS = ["Dia", "Noche"]
 W_SCALE = 10_000
 LEXI_TOL_PCT = 0.0025
-TARGET_BUDGET_USE = 0.995
 DEFAULT_MIN_BUDGET_USE = 0.0
 DEFAULT_COSTO_DIA_COP_H = int(round(1_500_000 / 9))
 DEFAULT_COSTO_NOCHE_COP_H = 250_000
@@ -789,12 +788,6 @@ def solve_milp_ahp_modified(
         return {"ok": True, **best_solution}
     final_solution = extract("Etapa 3", status3)
     final_solution["logs"] = logs
-    if final_solution["kpis"]["Uso presupuesto %"] < TARGET_BUDGET_USE:
-        final_solution["warning"] = (
-            "La etapa 3 maximizó el presupuesto usado, pero no alcanzó 99.5 %. "
-            "Con los datos actuales, el presupuesto restante no puede gastarse sin romper alguna restricción activa: "
-            "techo físico Q_f <= Q_puntual, capacidad por turnos, conservación de muestras, costos discretos o coherencia AHP preservada."
-        )
     return {"ok": True, **final_solution}
 
 
