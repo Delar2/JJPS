@@ -741,12 +741,9 @@ def solve_milp_ahp_modified(
         return {"ok": True, **best_solution}
     final_solution = extract("Etapa 3", status3)
     final_solution["logs"] = logs
-    if final_solution["kpis"]["Uso presupuesto %"] < TARGET_BUDGET_USE:
-        final_solution["warning"] = (
-            "La etapa 3 maximizó el presupuesto usado, pero no alcanzó 99.5 %. "
-            "Con los datos actuales, el presupuesto restante no puede gastarse sin romper alguna restricción activa: "
-            "techo físico Q_f <= Q_puntual, capacidad por turnos, conservación de muestras, costos discretos o coherencia AHP preservada."
-        )
+    # No se muestra advertencia si el presupuesto usado no alcanza 99.5 %.
+    # La etapa 3 ya maximiza C_used bajo las restricciones del modelo;
+    # por tanto, la solución sigue siendo válida aunque quede presupuesto sin usar.
     return {"ok": True, **final_solution}
 
 
